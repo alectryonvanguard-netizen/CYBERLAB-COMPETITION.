@@ -4,10 +4,10 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 android {
-    namespace = "com.cyberlab.twirlly"
+    namespace = "com.openai.cyberlab"
     compileSdk = 35
     defaultConfig {
-        applicationId = "com.cyberlab.twirlly"
+        applicationId = "com.openai.cyberlab"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
