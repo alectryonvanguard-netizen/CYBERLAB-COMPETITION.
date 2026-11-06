@@ -319,7 +319,9 @@ private fun LessonScreen(title: String, onBack: () -> Unit) {
     val options = listOf("Use a unique passphrase and enable MFA", "Reuse one short password everywhere", "Share passwords with trusted friends")
     Column(Modifier.fillMaxSize().padding(22.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "Back", tint = White) }
+            IconButton(onClick = onBack) {
+    Icon(Icons.Outlined.ArrowBack, "Back", tint = White)
+            }
             Text("LEARNING MODULE", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
         }
         Spacer(Modifier.height(20.dp))
