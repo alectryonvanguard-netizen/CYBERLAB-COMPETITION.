@@ -428,7 +428,7 @@ private fun ProfileScreen(store: ProgressStore) {
                 Text("LEARNER NAME", color = Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 OutlinedTextField(name, { name = it }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
                     singleLine = true, label = { Text("Name or nickname") })
-                Button(onClick = { store.setLearner(name) }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                Button(onClick = { store.updateLearner(name) }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = Ink)) {
                     Text("Save profile")
                 }
