@@ -1,4 +1,4 @@
-package com.cyberlab.twirlly
+package com.openai.cyberlab
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
