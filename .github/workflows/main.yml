@@ -22,6 +22,7 @@ jobs:
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
+      # Initialise Java on the container matching production layout specifications
       - name: Initialize Java Infrastructure Environment
         uses: actions/setup-java@v5
         with:
@@ -46,7 +47,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # FIXED TRUE LINK: Pulls the authentic binary payload archive directly into the runner environment
+      # THE ABSOLUTE REPAIR: Pulls the authentic binary payload archive directly into the runner environment
       - name: Pre-Download and Inject Stable Android NDK r25b
         run: |
           mkdir -p ~/.buildozer/android/platform
@@ -55,6 +56,7 @@ jobs:
           unzip -q android-ndk-r25b-linux.zip
           rm android-ndk-r25b-linux.zip
 
+      # Executes using local pre-downloaded assets instead of hitting a broken urllib download pipe
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
