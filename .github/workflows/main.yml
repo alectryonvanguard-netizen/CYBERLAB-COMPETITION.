@@ -23,25 +23,27 @@ jobs:
       - name: Initialize Android SDK Environment
         uses: android-actions/setup-android@v4
 
-      # Explicitly pre-load the stable SDK and build tools directly into the runner environment
-      - name: Pre-Install Android SDK & Toolchain Components
-        run: |
-          sdkmanager --install "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
-          yes | sdkmanager --licenses || true
-
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential
+          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential wget
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
+
+      # FIX: Manually pre-downloading and extracting the NDK to bypass Buildozer's internal downloader bug
+      - name: Pre-Download and Inject Stable Android NDK r25b
+        run: |
+          mkdir -p ~/.buildozer/android/platform/
+          wget -q https://google.com -O ~/android-ndk-r25b-linux.zip
+          unzip -q ~/android-ndk-r25b-linux.zip -d ~/.buildozer/android/platform/
+          rm ~/android-ndk-r25b-linux.zip
 
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
-          yes | buildozer android debug
-
+          buildozer android debug
+          
       - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
         with:
