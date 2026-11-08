@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize Java Infrastructure Environment
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -30,7 +30,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
-      # VERIFIED UTILITY: Pulls the true binary payload archive directly into the runner environment
+      # FIX: Hardcoded the literal, authentic Google repository binary path
       - name: Pre-Download and Inject Stable Android NDK r25b
         run: |
           mkdir -p ~/.buildozer/android/platform/
