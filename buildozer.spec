@@ -10,16 +10,16 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- STABLE INFRASTRUCTURE CORE SETTINGS ---
+# --- MASTERPIECE INFRASTRUCTURE SETTINGS ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Explicit compiler toolchain mappings
-android.api = 33
+# Target modern Android 14/15 devices cleanly
+android.api = 34
 android.minapi = 21
-android.sdk_build_tools = 33.0.2
-android.ndk = 25.2.9519653
-android.ndk_api = 21
+
+# DO NOT hardcode android.ndk or android.sdk_build_tools lines here.
+# Let the master branch auto-match NDK 28c cleanly.
 
 android.archs = arm64-v8a
 p4a.branch = master
