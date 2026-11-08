@@ -14,14 +14,12 @@ fullscreen = 0
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Directing mappings to find the pre-staged r25b local archive folders
+# Reset to let the baseline build engine manage the versions natively
 android.api = 33
 android.minapi = 21
-android.ndk = 25b
-android.ndk_api = 21
 
 android.archs = arm64-v8a
-p4a.branch = release-2024.01.21
+p4a.branch = master
 
 [buildozer]
 log_level = 2
