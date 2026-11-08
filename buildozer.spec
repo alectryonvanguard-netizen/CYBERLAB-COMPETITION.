@@ -10,16 +10,21 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- INFRASTRUCTURE SETTINGS ---
+# --- PRODUCTION PERMISSIONS & SERVICES ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Reset to let the baseline build engine manage the versions natively
+# Target parameters matching the GitHub workspace paths
 android.api = 33
 android.minapi = 21
 
+# --- THE BYPASS FIX: LOCAL PACKAGING PATHS ---
+# Directing buildozer to local files to avoid urllib download failures
+android.sdk_path = /usr/local/lib/android/sdk
+android.ndk_path = /usr/local/lib/android/sdk/ndk/25.2.9519653
+
 android.archs = arm64-v8a
-p4a.branch = master
+p4a.branch = release-2024.01.21
 
 [buildozer]
 log_level = 2
