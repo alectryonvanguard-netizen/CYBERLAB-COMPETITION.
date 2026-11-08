@@ -1,4 +1,3 @@
-
 name: Compile .engine Production Package
 
 on:
@@ -45,6 +44,13 @@ jobs:
           sed -i "s|^p4a.branch.*|p4a.branch = v2024.01.21|" buildozer.spec
           grep -q "^android.accept_sdk_license" buildozer.spec || sed -i '/^\[app\]/a android.accept_sdk_license = True' buildozer.spec
           grep -E "sdk_path|ndk_path|p4a|accept_sdk" buildozer.spec
+
+      # buildozer 1.5.0 looks for sdkmanager at the legacy tools/bin path
+      - name: Link sdkmanager to the legacy path buildozer expects
+        run: |
+          mkdir -p $ANDROID_HOME/tools/bin
+          ln -sf $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager $ANDROID_HOME/tools/bin/sdkmanager
+          ls -l $ANDROID_HOME/tools/bin/
 
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
