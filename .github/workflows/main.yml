@@ -67,6 +67,37 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
+      # buildozer.spec points at icon.png; create a placeholder if the repo has none
+      - name: Ensure icon.png exists
+        run: |
+          python3 - <<'EOF'
+          import os, zlib, struct
+          if not os.path.exists("icon.png"):
+              S = 512
+              bg = (10, 14, 26)
+              fg = (34, 211, 238)
+              mid = S / 2
+              rows = []
+              for y in range(S):
+                  row = bytearray([0])
+                  for x in range(S):
+                      dist = ((x - mid) ** 2 + (y - mid) ** 2) ** 0.5
+                      row += bytes(fg if 120 <= dist <= 190 else bg)
+                  rows.append(bytes(row))
+              raw = b"".join(rows)
+              def chunk(tag, data):
+                  body = struct.pack(">I", len(data)) + tag + data
+                  return body + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+              png = (b"\x89PNG\r\n\x1a\n"
+                     + chunk(b"IHDR", struct.pack(">IIBBBBB", S, S, 8, 2, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw, 9))
+                     + chunk(b"IEND", b""))
+              open("icon.png", "wb").write(png)
+              print("generated placeholder icon.png")
+          else:
+              print("icon.png already present")
+          EOF
+
       # Fails fast (seconds, not 8 minutes) and shows file + line as an annotation
       - name: Syntax check Python sources
         run: |
