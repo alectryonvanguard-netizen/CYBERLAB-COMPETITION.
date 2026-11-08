@@ -10,11 +10,11 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- CORE PRODUCTION INFRASTRUCTURE PARAMETERS ---
+# --- INFRASTRUCTURE LAYOUT ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Linking paths directly to match the r25b setup folder layout
+# Linking paths to perfectly match the injected r25b folder structures
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
