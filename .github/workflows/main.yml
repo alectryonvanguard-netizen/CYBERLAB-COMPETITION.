@@ -79,7 +79,12 @@ jobs:
               try:
                   ast.parse(open(f, encoding='utf-8').read(), f)
               except SyntaxError as e:
-                  print(f"::error file={f},line={e.lineno}::{e.msg}")
+                  ln = e.lineno or 1
+                  print(f"::error file={f},line={ln}::{e.msg}")
+                  print(f"SYNTAX ERROR in {f} at line {ln}: {e.msg}")
+                  src = open(f, encoding='utf-8').read().splitlines()
+                  for n in range(max(0, ln - 15), min(len(src), ln + 2)):
+                      print(f"{n + 1:5}: {src[n]}")
                   bad = True
           sys.exit(1 if bad else 0)
           EOF
@@ -94,7 +99,8 @@ jobs:
 
       - name: Show error tail
         if: failure()
-        run: tail -n 100 build.log
+        run: |
+          if [ -f build.log ]; then tail -n 100 build.log; else echo "No build.log (failed before the build step)"; fi
 
       - name: Upload build log
         if: always()
