@@ -14,7 +14,7 @@ fullscreen = 0
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Linking stable API parameters
+# Linking stable API toolchains matching production standards
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
