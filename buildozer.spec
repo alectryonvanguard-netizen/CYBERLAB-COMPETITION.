@@ -10,14 +10,16 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- THE DYNAMIC INFRASTRUCTURE FIX ---
+# --- STABLE INFRASTRUCTURE CORE SETTINGS ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Explicitly command the compiler to fetch necessary build tools
-android.api = 34
+# Explicit compiler toolchain mappings
+android.api = 33
 android.minapi = 21
-android.sdk_build_tools = 34.0.0
+android.sdk_build_tools = 33.0.2
+android.ndk = 25.2.9519653
+android.ndk_api = 21
 
 android.archs = arm64-v8a
 p4a.branch = master
