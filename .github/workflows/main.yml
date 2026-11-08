@@ -14,8 +14,9 @@ jobs:
       - name: Check out repository workspace source
         uses: actions/checkout@v4
 
+      # Upgraded to v5 to fix deprecation alerts
       - name: Initialize Java Infrastructure Environment
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -38,9 +39,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
+      # Auto-accepts all Android SDK licenses directly inside the runner environment
       - name: Execute Native Android Architecture Compilation
-        # Automatically passes agreement prompts to the Android SDK Manager
-        run: yes | buildozer android debug
+        run: |
+          mkdir -p ~/.android
+          touch ~/.android/repositories.cfg
+          yes | buildozer android debug
 
       - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
