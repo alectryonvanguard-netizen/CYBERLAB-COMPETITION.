@@ -14,7 +14,6 @@ jobs:
       - name: Check out repository workspace source
         uses: actions/checkout@v4
 
-      # Upgraded to v5 to fix deprecation alerts
       - name: Initialize Java Infrastructure Environment
         uses: actions/setup-java@v5
         with:
@@ -27,7 +26,7 @@ jobs:
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential
           python3 -m pip install --upgrade pip
           python3 -m pip install buildozer cython virtualenv
 
@@ -39,7 +38,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # Auto-accepts all Android SDK licenses directly inside the runner environment
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
