@@ -14,7 +14,7 @@ fullscreen = 0
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Stable platform configurations matching the environment
+# Linking paths to perfectly match the pre-installed system folder layers
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
