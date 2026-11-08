@@ -67,6 +67,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
+      # Fails fast (seconds, not 8 minutes) and shows file + line as an annotation
+      - name: Syntax check Python sources
+        run: |
+          python3 - <<'EOF'
+          import ast, glob, sys
+          bad = False
+          for f in glob.glob('**/*.py', recursive=True):
+              if f.startswith(('.buildozer', 'bin')):
+                  continue
+              try:
+                  ast.parse(open(f, encoding='utf-8').read(), f)
+              except SyntaxError as e:
+                  print(f"::error file={f},line={e.lineno}::{e.msg}")
+                  bad = True
+          sys.exit(1 if bad else 0)
+          EOF
+
       - name: Execute Native Android Architecture Compilation
         shell: bash
         run: |
