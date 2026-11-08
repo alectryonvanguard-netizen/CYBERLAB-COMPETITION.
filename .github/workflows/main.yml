@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize Java Infrastructure Environment
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -23,27 +23,23 @@ jobs:
       - name: Initialize Android SDK Environment
         uses: android-actions/setup-android@v4
 
+      # Explicitly pre-load the stable SDK and build tools directly into the runner environment
+      - name: Pre-Install Android SDK & Toolchain Components
+        run: |
+          sdkmanager --install "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+          yes | sdkmanager --licenses || true
+
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential
           python3 -m pip install --upgrade pip
-          python3 -m pip install buildozer cython virtualenv
-
-      - name: Restore Compiler Cache Architecture
-        uses: actions/cache@v4
-        with:
-          path: ~/.buildozer
-          key: ${{ runner.os }}-build-cache-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            ${{ runner.os }}-build-cache-
+          python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
-          # Auto-accept all licenses for the incoming NDK components
-          yes | sdkmanager --licenses || true
           yes | buildozer android debug
 
       - name: Export Master Production APK Package Artifact
