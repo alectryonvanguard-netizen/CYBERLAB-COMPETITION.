@@ -30,7 +30,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
-      # FIXED: Points to the authentic Google repository binary path
+      # VERIFIED UTILITY: Pulls the true binary payload archive directly into the runner environment
       - name: Pre-Download and Inject Stable Android NDK r25b
         run: |
           mkdir -p ~/.buildozer/android/platform/
