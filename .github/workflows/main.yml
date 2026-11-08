@@ -30,7 +30,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
-      # FIX: Manually pre-downloading and extracting the NDK to bypass Buildozer's internal downloader bug
+      # FIXED: Points to the authentic Google repository binary path
       - name: Pre-Download and Inject Stable Android NDK r25b
         run: |
           mkdir -p ~/.buildozer/android/platform/
