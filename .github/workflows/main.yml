@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize Java Infrastructure Environment
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -38,12 +38,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # FIX: Removed wget entirely. Added --accept-sdk-license to avoid broken command pipes.
-      - name: Execute Native Android Architecture Compilation
+      # FIX: Auto-injecting verified Android SDK and NDK license hashes into the environment workspace
+      - name: Pre-Approve Android SDK & NDK Licenses
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
-          buildozer android debug --accept-sdk-license
+          mkdir -p $ANDROID_HOME/licenses
+          echo -e "\n8933bad161ad4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb7431302ba76463b978\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
+          echo -e "\n84831b9409646a54c5f35e431dbaf43e728d228a" > $ANDROID_HOME/licenses/android-sdk-preview-license
+          
+      - name: Execute Native Android Architecture Compilation
+        run: |
+          buildozer android debug
           
       - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
