@@ -10,15 +10,14 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- PRODUCTION INFRASTRUCTURE PARAMETERS ---
+# --- INFRASTRUCTURE LAYOUT ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Pinned stable toolchain pairs to completely match the automated workflow injection paths
+# Stable platform configurations matching the environment
 android.api = 33
 android.minapi = 21
-android.sdk_build_tools = 33.0.2
-android.ndk = 25.2.9519653
+android.ndk = 25b
 android.ndk_api = 21
 
 android.archs = arm64-v8a
