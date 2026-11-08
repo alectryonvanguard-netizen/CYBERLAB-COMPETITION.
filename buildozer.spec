@@ -14,7 +14,7 @@ fullscreen = 0
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Linking paths to perfectly match the injected r25b folder structures
+# Linking stable API parameters
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
