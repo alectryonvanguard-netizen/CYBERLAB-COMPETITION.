@@ -1,26 +1,67 @@
-name: Build Android APK
-on: [push, workflow_dispatch]
+name: Compile .engine Production Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
 
 jobs:
-  build:
+  build-android:
+    name: Build .engine Native Android Package
     runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Get Architecture Compiler Cache
+    steps:
+      - name: Check out repository workspace source
+        uses: actions/checkout@v4
+
+      # Purges unnecessary packages to ensure a clean disk partition
+      - name: Free Disk Space for NDK Compilation
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Initialize Java Infrastructure Environment
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Initialize Android SDK Environment
+        uses: android-actions/setup-android@v4
+
+      # Pre-loading the stable NDK components into the local system paths
+      - name: Pre-Install Android SDK & Toolchain Components
+        run: |
+          ${{ env.ANDROID_HOME }}/cmdline-tools/latest/bin/sdkmanager --install "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+          yes | ${{ env.ANDROID_HOME }}/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Install Low-Level C/C++ Compiler Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
+
+      - name: Restore Compiler Cache Architecture
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          key: ${{ runner.os }}-build-cache-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-build-cache-
 
-      - name: Build with Buildozer Actions Engine
-        uses: ArtemGovorov/buildozer-action@v1
-        with:
-          command: buildozer android debug
-          repository_root: .
-
-      - name: Export Output App Binary
+      # Compiles using local system assets instead of fetching from the web
+      - name: Execute Native Android Architecture Compilation
+        run: |
+          mkdir -p ~/.android
+          touch ~/.android/repositories.cfg
+          buildozer android debug
+          
+      - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DomainEngine-Package
+          name: engine-production-binary
           path: bin/*.apk
+          if-no-files-found: error
