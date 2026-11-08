@@ -12,7 +12,7 @@ from kivy.uix.gridlayout import GridLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.clock import Clock
 
-ACCESS_PASSWORD = "MySecurePassword123"  # Customize your access gatekeeper password here
+ACCESS_PASSWORD = "MySecurePassword123"  # Set your private gatekeeper password here
 PROXY_PORT = 8080
 MAX_APPS = 15
 
@@ -22,7 +22,6 @@ class EnginePlatform(App):
         if 'ANDROID_ARGUMENT' in os.environ:
             from android.storage import app_storage_path
             self.registry_file = os.path.join(app_storage_path(), "engine_registry.json")
-            # Trigger Android background service lock if available
             try:
                 from android import python_act
                 python_act.start_service(title=".engine Proxy Engine", text="Listening on port 8080")
@@ -52,9 +51,6 @@ class EnginePlatform(App):
             with open(self.registry_file, "w") as f: json.dump(self.registry, f, indent=4)
         except: pass
 
-    # ==========================================
-    # SECURITY GATEWAY SCREEN
-    # ==========================================
     def show_login_screen(self):
         self.window.clear_widgets()
         self.window.add_widget(Label(text=".engine SYSTEM CORE", font_size='24sp', bold=True, color=(0, 1, 0, 1), size_hint_y=0.2))
@@ -77,15 +73,11 @@ class EnginePlatform(App):
             self.password_input.text = ""
             self.password_input.hint_text = "INVALID SECURITY CREDENTIALS"
 
-    # ==========================================
-    # MODERN MONITORING DASHBOARD PANEL
-    # ==========================================
     def show_dashboard_screen(self):
         self.window.clear_widgets()
         
-        # Live Hardware Infrastructure Metric Dashboard Row
         metrics_bar = GridLayout(cols=3, size_hint_y=0.15, spacing=5)
-        self.req_label = Label(text="Requests: 0", bgcolor=(0.1, 0.1, 0.1, 1))
+        self.req_label = Label(text="Requests: 0")
         self.bandwidth_label = Label(text="Traffic: 0 KB")
         self.status_label = Label(text="Core Status: 24/7 ONLINE", color=(0, 1, 0, 1))
         metrics_bar.add_widget(self.req_label)
@@ -93,7 +85,6 @@ class EnginePlatform(App):
         metrics_bar.add_widget(self.status_label)
         self.window.add_widget(metrics_bar)
 
-        # Dynamic Configuration Registry Form
         form_frame = BoxLayout(orientation='horizontal', size_hint_y=0.12, spacing=5)
         self.subdomain_input = TextInput(hint_text="Subdomain Name", multiline=False, background_color=(0.2, 0.2, 0.2, 1), foreground_color=(1, 1, 1, 1))
         self.port_input = TextInput(hint_text="Target Port", multiline=False, background_color=(0.2, 0.2, 0.2, 1), foreground_color=(1, 1, 1, 1))
@@ -104,7 +95,6 @@ class EnginePlatform(App):
         form_frame.add_widget(reg_btn)
         self.window.add_widget(form_frame)
 
-        # Registered Routing Matrix Display
         self.apps_counter = Label(text=f"Active Network Nodes: {len(self.registry)} / {MAX_APPS}", size_hint_y=0.05, color=(1, 1, 0, 1), bold=True)
         self.window.add_widget(self.apps_counter)
 
@@ -114,7 +104,6 @@ class EnginePlatform(App):
         scroll_view.add_widget(self.scroll_layout)
         self.window.add_widget(scroll_view)
 
-        # Live Real-time Traffic Terminal Log Output
         self.window.add_widget(Label(text="Live Console Logs:", size_hint_y=0.05, halign='left'))
         self.log_layout = GridLayout(cols=1, spacing=2, size_hint_y=None)
         self.log_layout.bind(minimum_height=self.log_layout.setter('height'))
@@ -124,15 +113,12 @@ class EnginePlatform(App):
 
         self.update_routing_display()
 
-    # ==========================================
-    # FUNCTIONAL SUBSYSTEM MATRIX
-    # ==========================================
     def register_app_domain(self, instance):
         name = self.subdomain_input.text.strip().lower().replace(".engine", "")
         port = self.port_input.text.strip()
         
         if len(self.registry) >= MAX_APPS:
-            self.log_action("ERROR: Registry storage architecture reached capacity ceiling.")
+            self.log_action("ERROR: Registry limit reached.")
             return
         if name and port.isdigit():
             self.registry[name] = int(port)
@@ -140,14 +126,14 @@ class EnginePlatform(App):
             self.subdomain_input.text = ""
             self.port_input.text = ""
             self.update_routing_display()
-            self.log_action(f"NODE CONNECTED: {name}.engine successfully mapped to interface port {port}")
+            self.log_action(f"NODE CONNECTED: {name}.engine -> Port {port}")
 
     def remove_app_domain(self, name):
         if name in self.registry:
             del self.registry[name]
             self.save_registry()
             self.update_routing_display()
-            self.log_action(f"NODE DISCONNECTED: Dropped mapping for {name}.engine")
+            self.log_action(f"NODE DISCONNECTED: {name}.engine")
 
     def update_routing_display(self):
         self.scroll_layout.clear_widgets()
@@ -165,7 +151,6 @@ class EnginePlatform(App):
         formatted_message = f"[{timestamp}] {message}"
         self.log_messages.append(formatted_message)
         if len(self.log_messages) > 30: self.log_messages.pop(0)
-        
         try:
             self.log_layout.clear_widgets()
             for msg in reversed(self.log_messages):
@@ -178,14 +163,11 @@ class EnginePlatform(App):
             self.bandwidth_label.text = f"Traffic: {round(self.bytes_transferred / 1024, 1)} KB"
         except: pass
 
-    # ==========================================
-    # BACKGROUND ENGINE BACKBONE (24/7 NETWORK SOCKETS)
-    # ==========================================
     def start_proxy_engine(self):
         if not self.is_server_running:
             self.is_server_running = True
             threading.Thread(target=self.run_network_socket, daemon=True).start()
-            self.log_action(f"Engine Core bound to background socket pipeline on port {PROXY_PORT}")
+            self.log_action(f"Engine Core active on proxy pipeline port {PROXY_PORT}")
 
     def run_network_socket(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -216,7 +198,26 @@ class EnginePlatform(App):
             lines = request_data.split(b"\r\n")
             for line in lines:
                 if line.startswith(b"Host:"):
-                    host_string = line.split(b" ")[1].decode('utf-8').strip()
+                    host_string = line.split(b" ").decode('utf-8').strip()
                     if ":" in host_string:
                         host_string = host_string.split(":")[0]
                     if host_string.endswith(".engine"):
+                        app_target = host_string.replace(".engine", "")
+                    break
+
+            if app_target and app_target in self.registry:
+                port = self.registry[app_target]
+                app_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                app_socket.connect(("127.0.0.1", port))
+                app_socket.sendall(request_data)
+                
+                while True:
+                    chunk = app_socket.recv(4096)
+                    if len(chunk) > 0:
+                        client_socket.sendall(chunk)
+                        self.bytes_transferred += len(chunk)
+                    else: break
+                app_socket.close()
+                self.log_action(f"200 OK: Routed {app_target}.engine")
+            else:
+                client_socket.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n.engine Error: App Node offline.")
