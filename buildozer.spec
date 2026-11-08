@@ -14,15 +14,17 @@ fullscreen = 0
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Target modern Android 14/15 devices cleanly
-android.api = 34
+# Explicitly use a stable, tested compilation toolchain pairing
+android.api = 33
 android.minapi = 21
-
-# DO NOT hardcode android.ndk or android.sdk_build_tools lines here.
-# Let the master branch auto-match NDK 28c cleanly.
+android.sdk_build_tools = 33.0.2
+android.ndk = 25.2.9519653
+android.ndk_api = 21
 
 android.archs = arm64-v8a
-p4a.branch = master
+
+# LOCK THIS TO A STABLE PRODUCTION TAG INSTEAD OF MASTER
+p4a.branch = release-2024.01.21
 
 [buildozer]
 log_level = 2
