@@ -1,71 +1,26 @@
-name: Compile .engine Production Package
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [main, master]
+name: Build Android APK
+on: [push, workflow_dispatch]
 
 jobs:
-  build-android:
-    name: Build .engine Native Android Package
+  build:
     runs-on: ubuntu-22.04
-
     steps:
-      - name: Check out repository workspace source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Free Disk Space for NDK Compilation
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-
-      # Initialise Java on the container matching production layout specifications
-      - name: Initialize Java Infrastructure Environment
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Initialize Android SDK Environment
-        uses: android-actions/setup-android@v4
-
-      - name: Install Low-Level C/C++ Compiler Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential curl
-          python3 -m pip install --upgrade pip
-          python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
-
-      - name: Restore Compiler Cache Architecture
+      - name: Get Architecture Compiler Cache
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: ${{ runner.os }}-build-cache-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            ${{ runner.os }}-build-cache-
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
 
-      # THE ABSOLUTE REPAIR: Pulls the authentic binary payload archive directly into the runner environment
-      - name: Pre-Download and Inject Stable Android NDK r25b
-        run: |
-          mkdir -p ~/.buildozer/android/platform
-          cd ~/.buildozer/android/platform
-          curl -L --retry 5 --retry-delay 5 https://google.com -o android-ndk-r25b-linux.zip
-          unzip -q android-ndk-r25b-linux.zip
-          rm android-ndk-r25b-linux.zip
+      - name: Build with Buildozer Actions Engine
+        uses: ArtemGovorov/buildozer-action@v1
+        with:
+          command: buildozer android debug
+          repository_root: .
 
-      # Executes using local pre-downloaded assets instead of hitting a broken urllib download pipe
-      - name: Execute Native Android Architecture Compilation
-        run: |
-          mkdir -p ~/.android
-          touch ~/.android/repositories.cfg
-          buildozer android debug
-          
-      - name: Export Master Production APK Package Artifact
+      - name: Export Output App Binary
         uses: actions/upload-artifact@v4
         with:
-          name: engine-production-binary
+          name: DomainEngine-Package
           path: bin/*.apk
-          if-no-files-found: error
