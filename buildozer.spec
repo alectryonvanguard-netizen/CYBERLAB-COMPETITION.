@@ -10,11 +10,11 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- MASTERPIECE SETTINGS ---
+# --- MASTERPIECE INFRASTRUCTURE LAYOUT ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Lock toolchains to stable NDK r25b configurations
+# Directing mappings to match the injected r25b folder structures
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
