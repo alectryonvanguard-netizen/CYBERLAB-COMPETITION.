@@ -14,6 +14,7 @@ jobs:
       - name: Check out repository workspace source
         uses: actions/checkout@v4
 
+      # Frees over 30GB of space so the virtual machine can uncompress the NDK layout
       - name: Free Disk Space for NDK Compilation
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -46,15 +47,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # FIX: Explicitly forcing buildozer to accept the pre-loaded runner SDK paths directly
+      # Standard clean execution block bypassing empty path injections
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
           yes | buildozer android debug
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
           
       - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
