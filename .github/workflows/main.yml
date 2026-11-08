@@ -14,11 +14,10 @@ jobs:
       - name: Check out repository workspace source
         uses: actions/checkout@v4
 
-      # Frees over 30GB of space so the virtual machine can uncompress the NDK layout
+      # Purges unnecessary packages to ensure a clean disk partition
       - name: Free Disk Space for NDK Compilation
         run: |
           sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
@@ -31,6 +30,12 @@ jobs:
 
       - name: Initialize Android SDK Environment
         uses: android-actions/setup-android@v4
+
+      # Pre-loading the stable NDK components into the local system paths
+      - name: Pre-Install Android SDK & Toolchain Components
+        run: |
+          ${{ env.ANDROID_HOME }}/cmdline-tools/latest/bin/sdkmanager --install "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+          yes | ${{ env.ANDROID_HOME }}/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
@@ -47,12 +52,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # Standard clean execution block bypassing empty path injections
+      # Compiles using local system assets instead of fetching from the web
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
-          yes | buildozer android debug
+          buildozer android debug
           
       - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
