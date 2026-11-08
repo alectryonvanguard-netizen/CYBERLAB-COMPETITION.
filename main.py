@@ -1,9 +1,6 @@
 import os
-import json
-import socket
 import hmac
 import hashlib
-import threading
 import time
 
 from kivy.app import App
@@ -11,21 +8,20 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.graphics import Color, RoundedRectangle
 from kivy.metrics import dp, sp
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
-from kivy.utils import get_color_from_hex as hx
+from kivy.utils import get_color_from_hex as hx, platform
+
+from engine_core import InfrastructureCore, MAX_APPS, default_registry_path
 
 # =====================================================================
 # CONFIG
 # =====================================================================
-DNS_PORT = 5353
-PROXY_PORT = 8080
-MAX_APPS = 15
-
 SECURE_SALT = b"CipherAegisSaltEngineCore2026"
 # PBKDF2-HMAC-SHA256 (100k rounds) of the access password "MySecurePassword123".
 # To change it, run:
@@ -132,238 +128,39 @@ class StatCard(Card):
 
 
 # =====================================================================
-# CORE NETWORK ENGINE
-# =====================================================================
-class InfrastructureCore:
-    def __init__(self, log_callback):
-        self.log = log_callback
-        self.registry_file = "engine_registry.json"
-        self.registry = self.load_registry_matrix()
-
-        self.total_requests = 0
-        self.bytes_transferred = 0
-        self.active_tunnels = 0
-
-        self.is_running = False
-        self.lock = threading.Lock()
-
-    def set_storage_path(self, path):
-        self.registry_file = path
-        self.registry = self.load_registry_matrix()
-
-    def load_registry_matrix(self):
-        if os.path.exists(self.registry_file):
-            try:
-                with open(self.registry_file, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
-
-    def commit_registry_matrix(self):
-        with self.lock:
-            try:
-                with open(self.registry_file, "w") as f:
-                    json.dump(self.registry, f, indent=4)
-            except Exception as e:
-                self.log(f"STORAGE ERROR: {e}")
-
-    def add_node(self, subdomain, port):
-        if subdomain not in self.registry and len(self.registry) >= MAX_APPS:
-            return False
-        self.registry[subdomain] = {"port": port, "created_at": time.time()}
-        self.commit_registry_matrix()
-        return True
-
-    def drop_node(self, subdomain):
-        if subdomain in self.registry:
-            del self.registry[subdomain]
-            self.commit_registry_matrix()
-
-    # ---------------- DNS ----------------
-    def start_dns_daemon(self):
-        dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        dns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            dns_sock.bind(("0.0.0.0", DNS_PORT))
-            self.log(f"DNS listening on port {DNS_PORT}")
-        except Exception as e:
-            self.log(f"DNS BIND FAILED: {e}")
-            return
-
-        dns_sock.settimeout(1.0)
-        while self.is_running:
-            try:
-                data, addr = dns_sock.recvfrom(512)
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-            threading.Thread(target=self.process_dns_query,
-                             args=(dns_sock, data, addr), daemon=True).start()
-        dns_sock.close()
-
-    def process_dns_query(self, sock, data, addr):
-        try:
-            transaction_id = data[:2]
-            query_body = b""
-            idx = 12
-            while data[idx] != 0:
-                length = data[idx]
-                query_body += data[idx:idx + length + 1]
-                idx += length + 1
-            query_body += b"\x00"
-
-            if b"\x06engine" not in query_body:
-                return
-
-            qtype = data[idx + 1:idx + 3]
-            question = query_body + data[idx + 1:idx + 5]
-
-            if qtype == b"\x00\x01":  # A record -> loopback
-                counters = b"\x00\x01\x00\x01\x00\x00\x00\x00"
-                answer = (b"\xc0\x0c" + b"\x00\x01\x00\x01" + b"\x00\x00\x00\x3c"
-                          + b"\x00\x04" + b"\x7f\x00\x00\x01")
-            else:  # AAAA etc -> empty answer
-                counters = b"\x00\x01\x00\x00\x00\x00\x00\x00"
-                answer = b""
-
-            payload = transaction_id + b"\x81\x80" + counters + question + answer
-            sock.sendto(payload, addr)
-        except Exception:
-            pass
-
-    # ---------------- PROXY ----------------
-    def start_proxy_daemon(self):
-        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            proxy_sock.bind(("0.0.0.0", PROXY_PORT))
-            proxy_sock.listen(200)
-            self.log(f"Proxy listening on port {PROXY_PORT}")
-        except Exception as e:
-            self.log(f"PROXY BIND FAILED: {e}")
-            return
-
-        proxy_sock.settimeout(1.0)
-        while self.is_running:
-            try:
-                client_conn, client_addr = proxy_sock.accept()
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-            with self.lock:
-                self.active_tunnels += 1
-            threading.Thread(target=self.orchestrate_tunnel,
-                             args=(client_conn, client_addr), daemon=True).start()
-        proxy_sock.close()
-
-    def orchestrate_tunnel(self, client_conn, client_addr):
-        self.total_requests += 1
-        upstream_conn = None
-        try:
-            header_buffer = client_conn.recv(4096)
-            if not header_buffer:
-                return
-
-            with self.lock:
-                self.bytes_transferred += len(header_buffer)
-
-            target_subdomain = None
-            for line in header_buffer.split(b"\r\n"):
-                if line.lower().startswith(b"host:"):
-                    host_value = line.split(b":", 1)[1].decode("utf-8").strip()
-                    if ":" in host_value:
-                        host_value = host_value.split(":")[0]
-                    if host_value.endswith(".engine"):
-                        target_subdomain = host_value[:-len(".engine")]
-                    break
-
-            if target_subdomain and target_subdomain in self.registry:
-                target_port = self.registry[target_subdomain]["port"]
-
-                upstream_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                upstream_conn.settimeout(5)
-                upstream_conn.connect(("127.0.0.1", target_port))
-                upstream_conn.sendall(header_buffer)
-
-                upstream_conn.setblocking(False)
-                client_conn.setblocking(False)
-
-                self.log(f"200 {target_subdomain}.engine -> :{target_port}")
-
-                runtime_active = True
-                while runtime_active and self.is_running:
-                    active_cycle = False
-                    try:
-                        chunk = client_conn.recv(4096)
-                        if chunk:
-                            upstream_conn.sendall(chunk)
-                            with self.lock:
-                                self.bytes_transferred += len(chunk)
-                            active_cycle = True
-                        else:
-                            runtime_active = False
-                    except BlockingIOError:
-                        pass
-
-                    try:
-                        chunk = upstream_conn.recv(4096)
-                        if chunk:
-                            client_conn.sendall(chunk)
-                            with self.lock:
-                                self.bytes_transferred += len(chunk)
-                            active_cycle = True
-                        else:
-                            runtime_active = False
-                    except BlockingIOError:
-                        pass
-
-                    if not active_cycle:
-                        time.sleep(0.005)
-            else:
-                err = (b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
-                       b"Connection: close\r\n\r\n.engine: no app is bound to this name.")
-                client_conn.sendall(err)
-                name = f"{target_subdomain}.engine" if target_subdomain else "(no .engine host)"
-                self.log(f"404 unregistered lookup: {name}")
-        except Exception as e:
-            self.log(f"Tunnel closed: {e}")
-        finally:
-            if upstream_conn is not None:
-                try:
-                    upstream_conn.close()
-                except Exception:
-                    pass
-            try:
-                client_conn.close()
-            except Exception:
-                pass
-            with self.lock:
-                self.active_tunnels -= 1
-
-
-# =====================================================================
 # UI
 # =====================================================================
 class EnginePlatform(App):
     def build(self):
         self.title = ".engine"
         Window.clearcolor = BG
+        if platform not in ("android", "ios"):
+            Window.size = (560, 860)
 
         self.log_buffer = []
         self._rendered_log_key = None
         self.core = InfrastructureCore(self.post_log_message)
-        self.core.set_storage_path(os.path.join(self.user_data_dir, "engine_registry.json"))
+        if platform == "android":
+            self.core.set_storage_path(os.path.join(self.user_data_dir, "engine_registry.json"))
+        else:
+            # same file the headless server / CLI uses on desktop
+            self.core.set_storage_path(default_registry_path())
 
+        outer = AnchorLayout(anchor_x="center", anchor_y="top")
         self.root_window = BoxLayout(
             orientation="vertical",
             padding=[dp(16), dp(28), dp(16), dp(16)],
             spacing=dp(12),
+            size_hint=(None, 1),
         )
+        self._fit_width(Window, Window.width)
+        Window.bind(width=self._fit_width)
+        outer.add_widget(self.root_window)
         self.render_secure_gateway()
-        return self.root_window
+        return outer
+
+    def _fit_width(self, window, width):
+        self.root_window.width = min(width, dp(640))
 
     def post_log_message(self, text):
         entry = f"{time.strftime('%H:%M:%S')}  {text}"
@@ -402,9 +199,7 @@ class EnginePlatform(App):
     def process_authorization(self, instance):
         input_hash = compute_secure_hash(self.pass_field.input.text)
         if hmac.compare_digest(input_hash, PASSWORD_HASH):
-            self.core.is_running = True
-            threading.Thread(target=self.core.start_dns_daemon, daemon=True).start()
-            threading.Thread(target=self.core.start_proxy_daemon, daemon=True).start()
+            self.core.start()
             self.render_system_console()
             Clock.schedule_interval(self.update_telemetry_metrics, 0.5)
         else:
@@ -420,6 +215,10 @@ class EnginePlatform(App):
         header.add_widget(make_label("●  ONLINE", size=12, color=GOOD, bold=True,
                                      halign="right", size_hint_x=0.4))
         self.root_window.add_widget(header)
+
+        self.net_label = make_label("Starting network...", size=12, color=MUTED,
+                                    size_hint_y=None, height=dp(18), shorten=True)
+        self.root_window.add_widget(self.net_label)
 
         stats = GridLayout(cols=3, spacing=dp(8), size_hint_y=None, height=dp(66))
         self.traffic_card = StatCard("Traffic", "0.0 KB", ACCENT)
@@ -506,7 +305,9 @@ class EnginePlatform(App):
                        size_hint_y=None, height=dp(60))
             info = BoxLayout(orientation="vertical")
             info.add_widget(make_label(f"{subdomain}.engine", size=15, bold=True))
-            info.add_widget(make_label(f"127.0.0.1:{config['port']}", size=12, color=MUTED))
+            info.add_widget(make_label(
+                f"{self.core.url_for(subdomain)}   >   :{config['port']}",
+                size=12, color=MUTED, shorten=True))
             row.add_widget(info)
             row.add_widget(RoundButton(
                 text="UNBIND", bg=DANGER, fg=BG, size_hint_x=None, width=dp(86),
@@ -527,6 +328,9 @@ class EnginePlatform(App):
             self.traffic_card.value_label.text = metric
             self.requests_card.value_label.text = str(self.core.total_requests)
             self.tunnels_card.value_label.text = str(self.core.active_tunnels)
+            self.net_label.text = (
+                f"Proxy :{self.core.proxy_port or '-'}   DNS :{self.core.dns_port or '-'}"
+                f"   {self.core.lan_ip}")
 
             key = (len(self.log_buffer), self.log_buffer[-1] if self.log_buffer else "")
             if key != self._rendered_log_key:
@@ -541,7 +345,7 @@ class EnginePlatform(App):
             pass
 
     def on_stop(self):
-        self.core.is_running = False
+        self.core.stop()
 
 
 if __name__ == "__main__":
