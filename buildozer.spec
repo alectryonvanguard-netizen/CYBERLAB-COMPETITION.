@@ -10,11 +10,11 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- INFRASTRUCTURE LAYOUT ---
+# --- INFRASTRUCTURE SETTINGS ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Linking paths to perfectly match the pre-installed system folder layers
+# Lock toolchains to stable matching standard releases
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
