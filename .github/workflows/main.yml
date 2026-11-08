@@ -26,23 +26,24 @@ jobs:
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential wget
+          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
-      # FIX: Hardcoded the literal, authentic Google repository binary path
-      - name: Pre-Download and Inject Stable Android NDK r25b
-        run: |
-          mkdir -p ~/.buildozer/android/platform/
-          wget -q https://google.com -O ~/android-ndk-r25b-linux.zip
-          unzip -q ~/android-ndk-r25b-linux.zip -d ~/.buildozer/android/platform/
-          rm ~/android-ndk-r25b-linux.zip
+      - name: Restore Compiler Cache Architecture
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: ${{ runner.os }}-build-cache-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-build-cache-
 
+      # FIX: Removed wget entirely. Added --accept-sdk-license to avoid broken command pipes.
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
-          buildozer android debug
+          buildozer android debug --accept-sdk-license
           
       - name: Export Master Production APK Package Artifact
         uses: actions/upload-artifact@v4
