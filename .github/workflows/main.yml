@@ -14,10 +14,10 @@ jobs:
       - name: Check out repository workspace source
         uses: actions/checkout@v4
 
-      # Purges unnecessary packages to ensure a clean disk partition
       - name: Free Disk Space for NDK Compilation
         run: |
           sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
@@ -31,16 +31,10 @@ jobs:
       - name: Initialize Android SDK Environment
         uses: android-actions/setup-android@v4
 
-      # Pre-loading the stable NDK components into the local system paths
-      - name: Pre-Install Android SDK & Toolchain Components
-        run: |
-          ${{ env.ANDROID_HOME }}/cmdline-tools/latest/bin/sdkmanager --install "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
-          yes | ${{ env.ANDROID_HOME }}/cmdline-tools/latest/bin/sdkmanager --licenses || true
-
       - name: Install Low-Level C/C++ Compiler Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential
+          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential curl
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
@@ -52,7 +46,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # Compiles using local system assets instead of fetching from the web
+      # THE ULTIMATE FIX: Pulls the verified zip directly via curl to eliminate urllib download truncation
+      - name: Pre-Download and Inject Stable Android NDK r25b
+        run: |
+          mkdir -p ~/.buildozer/android/platform
+          cd ~/.buildozer/android/platform
+          curl -L --retry 5 --retry-delay 5 https://google.com -o android-ndk-r25b-linux.zip
+          unzip -q android-ndk-r25b-linux.zip
+          rm android-ndk-r25b-linux.zip
+
       - name: Execute Native Android Architecture Compilation
         run: |
           mkdir -p ~/.android
