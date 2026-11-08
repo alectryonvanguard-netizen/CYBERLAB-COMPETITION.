@@ -1,0 +1,50 @@
+name: Compile .engine Production Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build-android:
+    name: Build .engine Native Android Package
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository workspace source
+        uses: actions/checkout@v4
+
+      - name: Initialize Java Infrastructure Environment
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Initialize Android SDK Environment
+        uses: android-actions/setup-android@v4
+
+      - name: Install Low-Level C/C++ Compiler Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+          python3 -m pip install --upgrade pip
+          python3 -m pip install buildozer cython virtualenv
+
+      - name: Restore Compiler Cache Architecture
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: ${{ runner.os }}-build-cache-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-build-cache-
+
+      - name: Execute Native Android Architecture Compilation
+        # Automatically passes agreement prompts to the Android SDK Manager
+        run: yes | buildozer android debug
+
+      - name: Export Master Production APK Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-production-binary
+          path: bin/*.apk
+          if-no-files-found: error
