@@ -46,7 +46,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
-      # THE ULTIMATE FIX: Pulls the verified zip directly via curl to eliminate urllib download truncation
+      # FIXED TRUE LINK: Pulls the authentic binary payload archive directly into the runner environment
       - name: Pre-Download and Inject Stable Android NDK r25b
         run: |
           mkdir -p ~/.buildozer/android/platform
