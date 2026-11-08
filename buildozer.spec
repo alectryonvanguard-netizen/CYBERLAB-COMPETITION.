@@ -10,13 +10,14 @@ icon.filename = icon.png
 orientation = portrait
 fullscreen = 0
 
-# --- REMOVED THE HARDCODED NDK VERSION PATH OVERRIDES ---
+# --- THE DYNAMIC INFRASTRUCTURE FIX ---
 android.permissions = INTERNET, FOREGROUND_SERVICE, WAKE_LOCK
 android.foreground_service = true
 
-# Let python-for-android handle the optimal NDK matching natively
+# Explicitly command the compiler to fetch necessary build tools
 android.api = 34
 android.minapi = 21
+android.sdk_build_tools = 34.0.0
 
 android.archs = arm64-v8a
 p4a.branch = master
