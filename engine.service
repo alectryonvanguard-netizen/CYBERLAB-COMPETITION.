@@ -1,0 +1,26 @@
+# Linux server: run .engine 24/7 and restart it if it ever stops.
+#   sudo mkdir -p /opt/engine /var/lib/engine
+#   sudo cp main.py engine_core.py engine_infra.py engine_admin.py /opt/engine/
+#   sudo useradd --system engine && sudo chown engine /var/lib/engine
+#   sudo -u engine ENGINE_DATA=/var/lib/engine python3 /opt/engine/engine_core.py setpassword
+#   sudo cp deploy/engine.service /etc/systemd/system/
+#   sudo systemctl enable --now engine
+[Unit]
+Description=.engine domain hosting engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=engine
+WorkingDirectory=/opt/engine
+Environment=ENGINE_DATA=/var/lib/engine
+ExecStart=/usr/bin/python3 /opt/engine/engine_core.py serve
+Restart=always
+RestartSec=3
+# lets a normal user listen on ports 53 and 80
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
