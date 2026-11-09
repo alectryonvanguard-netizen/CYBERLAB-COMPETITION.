@@ -31,8 +31,26 @@ def is_android():
 
 
 def default_registry_path():
-    base = os.environ.get("ENGINE_DATA") or os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "engine_registry.json")
+    """One shared data folder for the app screen and the background service."""
+    if is_android():
+        base = os.environ.get("ANDROID_PRIVATE")
+    else:
+        base = os.environ.get("ENGINE_DATA")
+    return os.path.join(base or os.path.dirname(os.path.abspath(__file__)),
+                        "engine_registry.json")
+
+
+def probe_port(port, timeout=0.3):
+    """True if something is listening on 127.0.0.1:port (the app is running)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("127.0.0.1", int(port)))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
 
 
 def hosts_path():
