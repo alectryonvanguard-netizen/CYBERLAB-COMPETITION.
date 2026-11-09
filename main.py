@@ -26,7 +26,8 @@ from kivy.utils import get_color_from_hex as hx, platform
 # If engine_core.py is missing from the APK, show the reason on screen
 # instead of closing silently.
 try:
-    from engine_core import InfrastructureCore, MAX_APPS, default_registry_path, probe_port
+    from engine_core import (InfrastructureCore, MAX_APPS, default_registry_path,
+                         probe_port, valid_name)
     IMPORT_ERROR = None
 except Exception:
     IMPORT_ERROR = traceback.format_exc()
@@ -564,20 +565,23 @@ class EnginePlatform(App):
             stats.add_widget(c)
         rw.add_widget(stats)
 
-        bind_panel = Panel(orientation="vertical", padding=dp(12), spacing=dp(10),
-                           size_hint_y=None, height=dp(124))
+        bind_panel = Panel(orientation="vertical", padding=dp(12), spacing=dp(8),
+                           size_hint_y=None, height=dp(150))
         row = BoxLayout(spacing=dp(8), size_hint_y=None, height=dp(48))
-        self.subdomain_field = Field(hint="name (e.g. clipsy)", size_hint_x=0.62)
-        self.port_field = Field(hint="port", size_hint_x=0.38)
+        self.subdomain_field = Field(hint="name (e.g. shop)", size_hint_x=0.4)
+        self.port_field = Field(hint="port / folder / blank", size_hint_x=0.6)
         row.add_widget(self.subdomain_field)
         row.add_widget(self.port_field)
         bind_panel.add_widget(row)
-        bind_panel.add_widget(NeonButton(text="[ BIND APP ]", size_hint_y=None, height=dp(46),
+        bind_panel.add_widget(make_label(
+            "port = app you run   |   folder = site   |   blank = new site",
+            size=10, color=MUTED, size_hint_y=None, height=dp(16)))
+        bind_panel.add_widget(NeonButton(text="[ REGISTER ]", size_hint_y=None, height=dp(46),
                                          on_release=self.execute_node_binding))
         rw.add_widget(bind_panel)
 
         self.nodes_tracker_label = make_label(
-            f"// REGISTERED APPS  0/{MAX_APPS}", size=12, color=MUTED,
+            f"// REGISTERED  0/{MAX_APPS}", size=12, color=MUTED,
             size_hint_y=None, height=dp(22))
         rw.add_widget(self.nodes_tracker_label)
 
@@ -604,24 +608,78 @@ class EnginePlatform(App):
     @guarded
     def execute_node_binding(self, instance):
         name = self.subdomain_field.input.text.strip().lower().replace(".engine", "")
-        port_raw = self.port_field.input.text.strip()
+        target = self.port_field.input.text.strip()
 
-        if not name or not port_raw.isdigit():
-            self.core.log("Enter a name and a numeric port.")
+        if not valid_name(name):
+            self.core.log("Name: letters, numbers and dashes only.")
             return
 
-        port_num = int(port_raw)
-        if not (1024 <= port_num <= 65535):
-            self.core.log("Port must be between 1024 and 65535.")
-            return
+        if target == "":
+            ok, what = self.core.add_site(name), "site"
+        elif target.isdigit():
+            port_num = int(target)
+            if not (1024 <= port_num <= 65535):
+                self.core.log("Port must be between 1024 and 65535.")
+                return
+            ok, what = self.core.add_node(name, port_num), f"app on port {port_num}"
+        else:
+            folder = os.path.abspath(os.path.expanduser(target))
+            if not os.path.isdir(folder):
+                self.core.log("Folder not found.")
+                return
+            ok, what = self.core.add_site(name, folder), "site"
 
-        if self.core.add_node(name, port_num):
+        if ok:
             self.subdomain_field.input.text = ""
             self.port_field.input.text = ""
             self.refresh_routing_display_tree()
-            self.core.log(f"Bound {name}.engine -> port {port_num}")
+            self.core.log(f"Registered {name}.engine ({what})")
         else:
-            self.core.log("Limit reached: 15 apps maximum.")
+            self.core.log("Limit reached: 15 entries maximum.")
+
+    # ---------------- SITE EDITOR ----------------
+    @guarded
+    def open_editor(self, name):
+        path = self.core.site_index_path(name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            content = ""
+        self._editing = name
+        rw = self.shell
+        rw.clear_widgets()
+        rw.add_widget(make_label(f"> edit {name}.engine", size=16, color=ACCENT,
+                                 size_hint_y=None, height=dp(34)))
+        rw.add_widget(make_label("index.html: paste or write your page, then SAVE",
+                                 size=11, color=MUTED, size_hint_y=None, height=dp(20)))
+        panel = Panel(orientation="vertical", padding=dp(8), size_hint=(1, 1))
+        self.editor_input = TextInput(
+            text=content, multiline=True, write_tab=False,
+            background_normal="", background_active="", background_color=(0, 0, 0, 0),
+            foreground_color=TEXT, cursor_color=ACCENT, font_name=FONT, font_size=sp(12))
+        panel.add_widget(self.editor_input)
+        rw.add_widget(panel)
+        self.editor_msg = make_label("", size=11, color=GOOD, size_hint_y=None, height=dp(18))
+        rw.add_widget(self.editor_msg)
+        buttons = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        buttons.add_widget(NeonButton(text="[ SAVE ]", on_release=self.save_editor))
+        buttons.add_widget(NeonButton(text="[ BACK ]", bg=MUTED, on_release=self.close_editor))
+        rw.add_widget(buttons)
+
+    @guarded
+    def save_editor(self, instance):
+        path = self.core.site_index_path(self._editing)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.editor_input.text)
+        self.editor_msg.text = "Saved. Reload the page in Chrome."
+        self.core.log(f"Saved {self._editing}.engine")
+
+    @guarded
+    def close_editor(self, instance):
+        self._rendered_log_key = None
+        self.render_system_console()
 
     @guarded
     def execute_node_purge(self, subdomain):
@@ -635,41 +693,51 @@ class EnginePlatform(App):
 
         if not self.core.registry:
             self.routing_grid.add_widget(make_label(
-                "no apps bound. add a name and port above.",
+                "nothing registered yet. add a name above.",
                 size=12, color=MUTED, halign="center",
                 size_hint_y=None, height=dp(60)))
 
-        for subdomain, config in self.core.registry.items():
+        for name, cfg in self.core.registry.items():
+            is_site = cfg.get("type") == "site"
             row = Panel(orientation="horizontal", padding=[dp(14), dp(8)], spacing=dp(8),
-                        size_hint_y=None, height=dp(60))
+                        size_hint_y=None, height=dp(84))
             info = BoxLayout(orientation="vertical")
-            info.add_widget(make_label(f"{subdomain}.engine", size=14, color=ACCENT))
-            info.add_widget(make_label(
-                f"{self.core.url_for(subdomain)}  >  :{config['port']}",
-                size=11, color=MUTED, shorten=True))
+            info.add_widget(make_label(f"{name}.engine", size=14, color=ACCENT))
+            info.add_widget(make_label(self.core.url_for(name), size=11, color=MUTED,
+                                       shorten=True))
+            state = make_label("...", size=11, color=MUTED)
+            self.status_labels[name] = state
+            info.add_widget(state)
             row.add_widget(info)
-            state = make_label("...", size=11, color=MUTED, halign="center",
-                               size_hint_x=None, width=dp(64))
-            self.status_labels[subdomain] = state
-            row.add_widget(state)
-            row.add_widget(NeonButton(
-                text="UNBIND", bg=DANGER, fg=BG, size_hint_x=None, width=dp(76),
-                font_size=sp(11),
-                on_release=lambda inst, s=subdomain: self.execute_node_purge(s)))
+
+            actions = BoxLayout(orientation="vertical", spacing=dp(6),
+                                size_hint_x=None, width=dp(78))
+            if is_site:
+                actions.add_widget(NeonButton(
+                    text="EDIT", font_size=sp(11),
+                    on_release=lambda inst, n=name: self.open_editor(n)))
+            actions.add_widget(NeonButton(
+                text="UNBIND", bg=DANGER, font_size=sp(11),
+                on_release=lambda inst, n=name: self.execute_node_purge(n)))
+            row.add_widget(actions)
             self.routing_grid.add_widget(row)
 
         self.nodes_tracker_label.text = (
-            f"// REGISTERED APPS  {len(self.core.registry)}/{MAX_APPS}")
+            f"// REGISTERED  {len(self.core.registry)}/{MAX_APPS}")
         self._probe_apps()
 
     def _probe_apps(self):
-        """Checks whether each registered app is actually running on its port."""
+        """Sites: is the folder there? Apps: is the app really running on its port?"""
         for name, cfg in self.core.registry.items():
             label = self.status_labels.get(name)
             if label is None:
                 continue
-            up = probe_port(cfg["port"])
-            label.text = "LIVE" if up else "OFFLINE"
+            if cfg.get("type") == "site":
+                up = os.path.isdir(cfg.get("path", ""))
+                label.text = "SITE  |  " + ("LIVE" if up else "FOLDER MISSING")
+            else:
+                up = probe_port(cfg["port"])
+                label.text = f"APP :{cfg['port']}  |  " + ("LIVE" if up else "OFFLINE")
             label.color = GOOD if up else WARN
 
     def _read_stats(self):
