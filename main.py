@@ -1,6 +1,8 @@
 import os
+import json
 import hmac
 import hashlib
+import secrets
 import time
 import traceback
 
@@ -33,17 +35,55 @@ except Exception:
     default_registry_path = None
 
 # =====================================================================
-# SECURITY
+# SECURITY: the owner creates the access key on first launch.
+# Only a salted PBKDF2 hash is stored on the device, never the password.
 # =====================================================================
-SECURE_SALT = b"CipherAegisSaltEngineCore2026"
-# PBKDF2-HMAC-SHA256 (100k rounds) of the access password "MySecurePassword123".
-# To change it, run:
-#   python -c "import hashlib;print(hashlib.pbkdf2_hmac('sha256', b'NEWPASS', b'CipherAegisSaltEngineCore2026', 100000).hex())"
-PASSWORD_HASH = "61a9387feefbf65175e963d05afb33a93f43d88cc8f665720a5f859c191beb83"
+ITERATIONS = 150000
+MIN_LENGTH = 8
+MAX_FAILS = 5
+LOCK_SECONDS = 30
 
 
-def compute_secure_hash(raw_password):
-    return hashlib.pbkdf2_hmac("sha256", raw_password.encode(), SECURE_SALT, 100000).hex()
+def password_checks(pw):
+    """Returns [(requirement text, satisfied?)] for the password rules."""
+    return [
+        (f"At least {MIN_LENGTH} characters", len(pw) >= MIN_LENGTH),
+        ("An uppercase letter (A-Z)", any(c.isupper() for c in pw)),
+        ("A lowercase letter (a-z)", any(c.islower() for c in pw)),
+        ("A number (0-9)", any(c.isdigit() for c in pw)),
+        ("A symbol (! @ # $ % ...)", any(not c.isalnum() and not c.isspace() for c in pw)),
+        ("No spaces", len(pw) > 0 and not any(c.isspace() for c in pw)),
+    ]
+
+
+def hash_password(pw, salt_hex, iterations=ITERATIONS):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex),
+                               iterations).hex()
+
+
+def read_auth(path):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if all(k in data for k in ("salt", "hash", "iterations")):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def write_auth(path, pw):
+    salt = secrets.token_hex(16)
+    data = {"salt": salt, "iterations": ITERATIONS,
+            "hash": hash_password(pw, salt, ITERATIONS)}
+    with open(path, "w") as f:
+        json.dump(data, f)
+    return data
+
+
+def check_auth(auth, pw):
+    return hmac.compare_digest(hash_password(pw, auth["salt"], auth["iterations"]),
+                               auth["hash"])
 
 
 # =====================================================================
@@ -247,7 +287,16 @@ class EnginePlatform(App):
         outer.add_widget(self.shell)
         root.add_widget(outer)
 
-        self.render_secure_gateway()
+        self._fails = 0
+        self._locked_until = 0
+        base = (self.user_data_dir if platform == "android"
+                else os.path.dirname(default_registry_path()))
+        self.auth_file = os.path.join(base, "engine_auth.json")
+        self.auth = read_auth(self.auth_file)
+        if self.auth:
+            self.render_secure_gateway()
+        else:
+            self.render_setup()
         return root
 
     def _fit_width(self, window, width):
@@ -294,14 +343,102 @@ class EnginePlatform(App):
 
     @guarded
     def process_authorization(self, instance):
-        input_hash = compute_secure_hash(self.pass_field.input.text)
-        if hmac.compare_digest(input_hash, PASSWORD_HASH):
-            self.core.start()
-            self.render_system_console()
-            Clock.schedule_interval(self.update_telemetry_metrics, 0.5)
+        now = time.time()
+        if now < self._locked_until:
+            self.auth_error.text = f"LOCKED. TRY AGAIN IN {int(self._locked_until - now) + 1}s"
+            return
+        entered = self.pass_field.input.text.strip()
+        if check_auth(self.auth, entered):
+            self._fails = 0
+            self._enter_console()
+            return
+        self._fails += 1
+        self.pass_field.input.text = ""
+        if self._fails >= MAX_FAILS:
+            self._fails = 0
+            self._locked_until = now + LOCK_SECONDS
+            self.auth_error.text = f"TOO MANY ATTEMPTS. LOCKED FOR {LOCK_SECONDS}s"
         else:
-            self.pass_field.input.text = ""
             self.auth_error.text = "ACCESS DENIED"
+
+    def _enter_console(self):
+        self.core.start()
+        self.render_system_console()
+        Clock.schedule_interval(self.update_telemetry_metrics, 0.5)
+
+    # ---------------- FIRST-TIME SETUP ----------------
+    def render_setup(self):
+        rw = self.shell
+        rw.clear_widgets()
+        rw.add_widget(BoxLayout(size_hint_y=0.05))
+        rw.add_widget(make_label("> .engine", size=34, color=ACCENT, halign="center",
+                                 size_hint_y=None, height=dp(52)))
+        rw.add_widget(make_label("FIRST-TIME SETUP  //  CREATE ACCESS KEY", size=11,
+                                 color=MUTED, halign="center", size_hint_y=None,
+                                 height=dp(22)))
+
+        panel = Panel(orientation="vertical", padding=dp(16), spacing=dp(10),
+                      size_hint_y=None, height=dp(452))
+        panel.add_widget(make_label("NEW PASSWORD", size=11, color=MUTED,
+                                    size_hint_y=None, height=dp(16)))
+        self.new_field = Field(hint="new password", password=True)
+        panel.add_widget(self.new_field)
+        panel.add_widget(make_label("CONFIRM PASSWORD", size=11, color=MUTED,
+                                    size_hint_y=None, height=dp(16)))
+        self.confirm_field = Field(hint="repeat password", password=True)
+        panel.add_widget(self.confirm_field)
+
+        self.req_labels = []
+        for text, _ in password_checks(""):
+            lbl = make_label("[ ] " + text, size=11, color=MUTED,
+                             size_hint_y=None, height=dp(18))
+            self.req_labels.append(lbl)
+            panel.add_widget(lbl)
+        self.match_label = make_label("", size=11, color=MUTED,
+                                      size_hint_y=None, height=dp(18))
+        panel.add_widget(self.match_label)
+
+        self.setup_button = NeonButton(text="[ CREATE KEY ]", size_hint_y=None,
+                                       height=dp(46), on_release=self.complete_setup)
+        panel.add_widget(self.setup_button)
+        rw.add_widget(panel)
+        rw.add_widget(BoxLayout())
+
+        self.new_field.input.bind(text=self._refresh_requirements)
+        self.confirm_field.input.bind(text=self._refresh_requirements)
+        self.confirm_field.input.bind(on_text_validate=lambda inst: self.complete_setup(None))
+        self._refresh_requirements()
+
+    def _setup_is_valid(self):
+        pw = self.new_field.input.text
+        return (all(ok for _, ok in password_checks(pw))
+                and pw == self.confirm_field.input.text)
+
+    def _refresh_requirements(self, *args):
+        pw = self.new_field.input.text
+        for lbl, (text, ok) in zip(self.req_labels, password_checks(pw)):
+            lbl.text = ("[x] " if ok else "[ ] ") + text
+            lbl.color = GOOD if ok else MUTED
+        confirm = self.confirm_field.input.text
+        if not confirm:
+            self.match_label.text = ""
+        elif confirm == pw:
+            self.match_label.text = "[x] Passwords match"
+            self.match_label.color = GOOD
+        else:
+            self.match_label.text = "[ ] Passwords do not match"
+            self.match_label.color = DANGER
+        valid = self._setup_is_valid()
+        self.setup_button.disabled = not valid
+        self.setup_button.opacity = 1 if valid else 0.4
+
+    @guarded
+    def complete_setup(self, instance):
+        if not self._setup_is_valid():
+            return
+        write_auth(self.auth_file, self.new_field.input.text)
+        self.auth = read_auth(self.auth_file)
+        self._enter_console()
 
     # ---------------- CONSOLE ----------------
     def render_system_console(self):
