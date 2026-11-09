@@ -21,6 +21,7 @@ import json
 import html
 import socket
 import mimetypes
+import select
 import posixpath
 import threading
 import time
@@ -33,6 +34,7 @@ DNS_PORTS = (53, 5353)
 PROXY_PORTS = (80, 8080)
 MAX_APPS = 15
 SUFFIXES = (".engine", ".localhost")
+IDLE_TIMEOUT = 120  # seconds an idle proxied connection may stay open
 
 HOSTS_BEGIN = "# >>> .engine managed block >>>"
 HOSTS_END = "# <<< .engine managed block <<<"
@@ -673,36 +675,30 @@ li{{margin:10px 0}}</style></head><body><h1>&gt; .engine</h1><ul>{items}</ul></b
                     self.access(ip, host, target, 502)
                     return
                 upstream_conn.sendall(header_buffer)
-                upstream_conn.setblocking(False)
-                client_conn.setblocking(False)
+                upstream_conn.settimeout(None)
+                client_conn.settimeout(None)
                 self.access(ip, host, target, 200)
 
+                # Event-driven relay: sleeps until data arrives (no busy polling),
+                # so hundreds of open connections cost almost no CPU.
                 moved = 0
-                active_tunnel = True
-                while active_tunnel and self.is_running:
-                    busy = False
-                    try:
-                        chunk = client_conn.recv(65536)
-                        if chunk:
-                            upstream_conn.sendall(chunk)
-                            moved += len(chunk)
-                            busy = True
-                        else:
-                            active_tunnel = False
-                    except BlockingIOError:
-                        pass
-                    try:
-                        chunk = upstream_conn.recv(65536)
-                        if chunk:
-                            client_conn.sendall(chunk)
-                            moved += len(chunk)
-                            busy = True
-                        else:
-                            active_tunnel = False
-                    except BlockingIOError:
-                        pass
-                    if not busy:
-                        time.sleep(0.003)
+                last_activity = time.time()
+                done = False
+                while not done and self.is_running:
+                    readable, _, _ = select.select([client_conn, upstream_conn], [], [], 1.0)
+                    if not readable:
+                        if time.time() - last_activity > IDLE_TIMEOUT:
+                            break
+                        continue
+                    for src in readable:
+                        dst = upstream_conn if src is client_conn else client_conn
+                        chunk = src.recv(65536)
+                        if not chunk:
+                            done = True
+                            break
+                        dst.sendall(chunk)
+                        moved += len(chunk)
+                        last_activity = time.time()
                 with self.lock:
                     self.bytes_transferred += moved
                 self._count(target, nbytes=moved, req=0)
