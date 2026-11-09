@@ -184,15 +184,18 @@ class StatCard(Panel):
         self.add_widget(make_label(title, size=10, color=MUTED))
 
 
-def unavailable_view():
+def unavailable_view(code=""):
     box = BoxLayout(orientation="vertical", padding=dp(32), spacing=dp(12))
-    box.add_widget(BoxLayout(size_hint_y=0.35))
+    box.add_widget(BoxLayout(size_hint_y=0.3))
     box.add_widget(make_label("> .engine", size=34, color=ACCENT, halign="center",
                               size_hint_y=None, height=dp(56)))
     box.add_widget(make_label(
         "The service could not start.\nClose the app and open it again.\n"
         "If this continues, please contact support.",
-        size=13, color=MUTED, halign="center", size_hint_y=None, height=dp(80)))
+        size=13, color=MUTED, halign="center", size_hint_y=None, height=dp(110)))
+    if code:
+        box.add_widget(make_label("Support code:\n" + code, size=11, color=MUTED,
+                                  halign="center", size_hint_y=None, height=dp(70)))
     box.add_widget(BoxLayout())
     return box
 
@@ -208,8 +211,10 @@ class EnginePlatform(App):
         try:
             return self._build()
         except Exception:
-            record_error(self, traceback.format_exc())
-            return unavailable_view()
+            err = traceback.format_exc()
+            record_error(self, err)
+            lines = [l for l in err.strip().splitlines() if l.strip()]
+            return unavailable_view(lines[-1][:90] if lines else "")
 
     def _build(self):
         if IMPORT_ERROR:
