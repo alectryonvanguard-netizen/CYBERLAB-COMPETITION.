@@ -3,7 +3,9 @@
 
 Run as a 24/7 server on a desktop, VPS or supercomputer:
     python engine_core.py serve
-    python engine_core.py add clipsy 8001
+    python engine_core.py site mysite            # new site with a starter page
+    python engine_core.py site mysite ./webfolder  # host an existing folder
+    python engine_core.py add clipsy 8001        # forward to an app on a port
     python engine_core.py remove clipsy
     python engine_core.py list
 
@@ -11,11 +13,16 @@ Use sudo / "Run as administrator" so it can bind port 53 + 80 and edit the
 hosts file. Without that it falls back to ports 5353 + 8080.
 """
 import os
+import re
 import sys
 import json
+import html
 import socket
+import mimetypes
+import posixpath
 import threading
 import time
+from urllib.parse import unquote
 
 DNS_PORTS = (53, 5353)
 PROXY_PORTS = (80, 8080)
@@ -38,6 +45,37 @@ def default_registry_path():
         base = os.environ.get("ENGINE_DATA")
     return os.path.join(base or os.path.dirname(os.path.abspath(__file__)),
                         "engine_registry.json")
+
+
+def valid_name(name):
+    return bool(re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?", name))
+
+
+def starter_page(name):
+    title = html.escape(name) + ".engine"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ margin:0; min-height:100vh; display:grid; place-items:center;
+         background:#05080f; color:#d6f6ff; font-family:system-ui,sans-serif; }}
+  main {{ text-align:center; padding:24px; }}
+  h1 {{ color:#00f0ff; font-size:2rem; margin:0 0 8px; }}
+  p {{ color:#5f7a94; margin:0; }}
+  code {{ color:#00ff9c; }}
+</style>
+</head>
+<body>
+<main>
+  <h1>{title}</h1>
+  <p>This site is hosted by <code>.engine</code>. Replace this page from the app.</p>
+</main>
+</body>
+</html>
+"""
 
 
 def probe_port(port, timeout=0.3):
@@ -137,10 +175,36 @@ class InfrastructureCore:
     def add_node(self, subdomain, port):
         if subdomain not in self.registry and len(self.registry) >= MAX_APPS:
             return False
-        self.registry[subdomain] = {"port": port, "created_at": time.time()}
+        self.registry[subdomain] = {"type": "app", "port": port, "created_at": time.time()}
         self.commit_registry_matrix()
         self.sync_hosts_file()
         return True
+
+    def sites_root(self):
+        return os.path.join(os.path.dirname(self.registry_file), "sites")
+
+    def add_site(self, subdomain, path=None):
+        """Registers a website hosted by the engine itself.
+        path=None creates a managed folder with a starter page."""
+        if subdomain not in self.registry and len(self.registry) >= MAX_APPS:
+            return False
+        managed = path is None
+        if managed:
+            path = os.path.join(self.sites_root(), subdomain)
+            os.makedirs(path, exist_ok=True)
+            index = os.path.join(path, "index.html")
+            if not os.path.exists(index):
+                with open(index, "w", encoding="utf-8") as f:
+                    f.write(starter_page(subdomain))
+        self.registry[subdomain] = {"type": "site", "path": path, "managed": managed,
+                                    "created_at": time.time()}
+        self.commit_registry_matrix()
+        self.sync_hosts_file()
+        return True
+
+    def site_index_path(self, subdomain):
+        entry = self.registry.get(subdomain, {})
+        return os.path.join(entry.get("path", ""), "index.html")
 
     def drop_node(self, subdomain):
         if subdomain in self.registry:
@@ -148,9 +212,14 @@ class InfrastructureCore:
             self.commit_registry_matrix()
             self.sync_hosts_file()
 
-    def url_for(self, name):
+    def url_for(self, name, local=None):
+        """The address that works on this device. Android cannot resolve .engine
+        names, so there it shows the .localhost form."""
+        if local is None:
+            local = is_android()
+        domain = "localhost" if local else "engine"
         suffix = "" if self.proxy_port == 80 else f":{self.proxy_port or PROXY_PORTS[-1]}"
-        return f"http://{name}.engine{suffix}"
+        return f"http://{name}.{domain}{suffix}"
 
     # ------------------------------------------------------- hosts file
     def sync_hosts_file(self):
@@ -308,6 +377,55 @@ class InfrastructureCore:
                              args=(client_conn, client_addr), daemon=True).start()
         proxy_sock.close()
 
+    def serve_static(self, conn, root, header_buffer, name):
+        def reply(code, text, body=b"", ctype="text/plain; charset=utf-8", head=False):
+            head_bytes = (f"HTTP/1.1 {code} {text}\r\nContent-Type: {ctype}\r\n"
+                          f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+            conn.sendall(head_bytes + (b"" if head else body))
+
+        conn.settimeout(15)
+        try:
+            first = header_buffer.split(b"\r\n", 1)[0].decode("latin-1")
+            method, target, _ = first.split(" ", 2)
+        except ValueError:
+            reply(400, "Bad Request", b"Bad request.")
+            return
+        if method not in ("GET", "HEAD"):
+            reply(405, "Method Not Allowed", b"Only GET and HEAD are supported.")
+            return
+
+        url_path = unquote(target.split("?", 1)[0].split("#", 1)[0])
+        rel = posixpath.normpath(url_path).lstrip("/")
+        root_real = os.path.realpath(root)
+        full = os.path.realpath(os.path.join(root_real, rel))
+        if full != root_real and not full.startswith(root_real + os.sep):
+            reply(403, "Forbidden", b"Forbidden.")
+            return
+        if os.path.isdir(full):
+            full = os.path.join(full, "index.html")
+        if not os.path.isfile(full):
+            reply(404, "Not Found", b"Page not found.")
+            self.log(f"404 {name}.engine {url_path}")
+            return
+
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
+            ctype += "; charset=utf-8"
+        size = os.path.getsize(full)
+        conn.sendall((f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n"
+                      f"Content-Length: {size}\r\nConnection: close\r\n\r\n").encode())
+        if method == "GET":
+            with open(full, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+            with self.lock:
+                self.bytes_transferred += size
+        if url_path in ("/", "/index.html"):
+            self.log(f"200 {name}.engine (site)")
+
     def orchestrate_tunnel(self, client_conn, client_addr):
         self.total_requests += 1
         upstream_conn = None
@@ -327,7 +445,11 @@ class InfrastructureCore:
                     break
 
             if target and target in self.registry:
-                target_port = self.registry[target]["port"]
+                entry = self.registry[target]
+                if entry.get("type") == "site":
+                    self.serve_static(client_conn, entry.get("path", ""), header_buffer, target)
+                    return
+                target_port = entry["port"]
                 upstream_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 upstream_conn.settimeout(5)
                 upstream_conn.connect(("127.0.0.1", target_port))
@@ -401,16 +523,30 @@ def main(argv):
             core.stop()
     elif cmd == "add" and len(argv) == 4 and argv[3].isdigit():
         name = argv[2].lower().replace(".engine", "")
-        if core.add_node(name, int(argv[3])):
-            print(f"Bound {name}.engine -> port {argv[3]}")
+        if valid_name(name) and core.add_node(name, int(argv[3])):
+            print(f"Bound {name}.engine -> app on port {argv[3]}")
         else:
-            print(f"Limit reached ({MAX_APPS} apps).")
+            print("Invalid name or limit reached.")
+    elif cmd == "site" and len(argv) in (3, 4):
+        name = argv[2].lower().replace(".engine", "")
+        folder = os.path.abspath(os.path.expanduser(argv[3])) if len(argv) == 4 else None
+        if not valid_name(name):
+            print("Name: letters, numbers and dashes only.")
+        elif folder and not os.path.isdir(folder):
+            print("Folder not found.")
+        elif core.add_site(name, folder):
+            print(f"Hosting {name}.engine from {folder or 'a new managed folder'}")
+        else:
+            print(f"Limit reached ({MAX_APPS}).")
     elif cmd == "remove" and len(argv) == 3:
         core.drop_node(argv[2].lower().replace(".engine", ""))
         print("Removed.")
     elif cmd == "list":
         for name, cfg in core.registry.items():
-            print(f"{name}.engine -> 127.0.0.1:{cfg['port']}")
+            if cfg.get("type") == "site":
+                print(f"{name}.engine -> site {cfg['path']}")
+            else:
+                print(f"{name}.engine -> app 127.0.0.1:{cfg['port']}")
     else:
         print(__doc__)
 
