@@ -236,7 +236,7 @@ class EnginePlatform(App):
         root = FloatLayout()
         root.add_widget(GridBackground(size_hint=(1, 1)))
         outer = AnchorLayout(anchor_x="center", anchor_y="top", size_hint=(1, 1))
-        self.root_window = BoxLayout(
+        self.shell = BoxLayout(
             orientation="vertical",
             padding=[dp(16), dp(28), dp(16), dp(16)],
             spacing=dp(12),
@@ -244,14 +244,14 @@ class EnginePlatform(App):
         )
         self._fit_width(Window, Window.width)
         Window.bind(width=self._fit_width)
-        outer.add_widget(self.root_window)
+        outer.add_widget(self.shell)
         root.add_widget(outer)
 
         self.render_secure_gateway()
         return root
 
     def _fit_width(self, window, width):
-        self.root_window.width = min(width, dp(640))
+        self.shell.width = min(width, dp(640))
 
     def on_pause(self):
         return True  # keep running when the user switches apps
@@ -267,7 +267,7 @@ class EnginePlatform(App):
 
     # ---------------- LOGIN ----------------
     def render_secure_gateway(self):
-        rw = self.root_window
+        rw = self.shell
         rw.clear_widgets()
         rw.add_widget(BoxLayout(size_hint_y=0.2))
 
@@ -305,7 +305,7 @@ class EnginePlatform(App):
 
     # ---------------- CONSOLE ----------------
     def render_system_console(self):
-        rw = self.root_window
+        rw = self.shell
         rw.clear_widgets()
 
         header = BoxLayout(size_hint_y=None, height=dp(40))
