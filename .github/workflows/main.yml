@@ -59,6 +59,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
+      # Restore compiler cache architecture
       - name: Restore Compiler Cache Architecture
         uses: actions/cache@v4
         with:
@@ -70,7 +71,7 @@ jobs:
       # Build-time guard: the app imports engine_core.py, so it must be in the repo
       - name: Check required source files
         run: |
-          for f in main.py engine_core.py service.py buildozer.spec; do
+          for f in main.py engine_core.py engine_infra.py engine_admin.py buildozer.spec; do
             if [ ! -f "$f" ]; then
               echo "::error::Missing $f in the repository root. Upload it and run again."
               exit 1
@@ -133,8 +134,8 @@ jobs:
           EOF
           grep -n "presplash" buildozer.spec
 
-      # Registers the background service and the permissions it needs
-      - name: Configure background service
+      # The phone app is a small companion: it only needs the network
+      - name: Configure app packaging
         run: |
           python3 - <<'EOF'
           import re
@@ -147,14 +148,12 @@ jobs:
                   s = re.sub(pat, key + " = " + val, s, flags=re.M)
               else:
                   s = re.sub(r"^\[app\]\s*$", "[app]\n" + key + " = " + val, s, count=1, flags=re.M)
-          setkey("requirements", "python3,kivy,pyjnius,android")
-          setkey("services", "engine:service.py:foreground:sticky")
-          setkey("android.permissions",
-                 "INTERNET, FOREGROUND_SERVICE, WAKE_LOCK, "
-                 "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, POST_NOTIFICATIONS")
+          setkey("requirements", "python3,kivy,pyjnius")
+          setkey("android.permissions", "INTERNET, ACCESS_NETWORK_STATE")
+          s = re.sub(r"^services\s*=.*\n", "", s, flags=re.M)
           open(p, "w").write(s)
           EOF
-          grep -n -E "^(requirements|services|android.permissions)" buildozer.spec
+          grep -n -E "^(requirements|services|android.permissions)" buildozer.spec || true
 
       # buildozer.spec points at icon.png; create a placeholder if the repo has none
       - name: Ensure icon.png exists
