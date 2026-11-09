@@ -1,10 +1,9 @@
 import os
 import json
-import hmac
-import hashlib
-import secrets
 import time
+import threading
 import traceback
+from urllib.parse import urlparse
 
 from kivy import kivy_data_dir
 from kivy.app import App
@@ -23,69 +22,18 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import get_color_from_hex as hx, platform
 
-# If engine_core.py is missing from the APK, show the reason on screen
-# instead of closing silently.
+# If a required module is missing from the app, show a clean message instead
+# of closing silently. Details go to a private log file only.
 try:
-    from engine_core import (InfrastructureCore, MAX_APPS, default_registry_path,
-                         probe_port, valid_name)
+    from engine_core import InfrastructureCore, MAX_APPS, default_registry_path
+    from engine_infra import (password_checks, read_auth, write_auth, check_auth,
+                              MAX_FAILS, LOCK_SECONDS, RemoteClient)
     IMPORT_ERROR = None
 except Exception:
     IMPORT_ERROR = traceback.format_exc()
     InfrastructureCore = None
     MAX_APPS = 15
     default_registry_path = None
-
-# =====================================================================
-# SECURITY: the owner creates the access key on first launch.
-# Only a salted PBKDF2 hash is stored on the device, never the password.
-# =====================================================================
-ITERATIONS = 150000
-MIN_LENGTH = 8
-MAX_FAILS = 5
-LOCK_SECONDS = 30
-
-
-def password_checks(pw):
-    """Returns [(requirement text, satisfied?)] for the password rules."""
-    return [
-        (f"At least {MIN_LENGTH} characters", len(pw) >= MIN_LENGTH),
-        ("An uppercase letter (A-Z)", any(c.isupper() for c in pw)),
-        ("A lowercase letter (a-z)", any(c.islower() for c in pw)),
-        ("A number (0-9)", any(c.isdigit() for c in pw)),
-        ("A symbol (! @ # $ % ...)", any(not c.isalnum() and not c.isspace() for c in pw)),
-        ("No spaces", len(pw) > 0 and not any(c.isspace() for c in pw)),
-    ]
-
-
-def hash_password(pw, salt_hex, iterations=ITERATIONS):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex),
-                               iterations).hex()
-
-
-def read_auth(path):
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        if all(k in data for k in ("salt", "hash", "iterations")):
-            return data
-    except Exception:
-        pass
-    return None
-
-
-def write_auth(path, pw):
-    salt = secrets.token_hex(16)
-    data = {"salt": salt, "iterations": ITERATIONS,
-            "hash": hash_password(pw, salt, ITERATIONS)}
-    with open(path, "w") as f:
-        json.dump(data, f)
-    return data
-
-
-def check_auth(auth, pw):
-    return hmac.compare_digest(hash_password(pw, auth["salt"], auth["iterations"]),
-                               auth["hash"])
-
 
 # =====================================================================
 # THEME: digital terminal
@@ -113,6 +61,27 @@ def make_label(text, size=14, color=TEXT, halign="left", **kw):
     return lbl
 
 
+def level_color(pct):
+    return GOOD if pct < 60 else (WARN if pct < 85 else DANGER)
+
+
+def fmt_bytes(n):
+    n = float(n or 0)
+    if n < 1024:
+        return f"{int(n)} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.2f} GB"
+
+
+def fmt_uptime(s):
+    s = int(s or 0)
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return (f"{d}d " if d else "") + f"{h}h {m}m"
+
+
 def record_error(app, text):
     """Errors go to a private log file only; users never see technical details."""
     try:
@@ -134,75 +103,28 @@ def guarded(fn):
     return wrapper
 
 
-# =====================================================================
-# ANDROID: background service, notifications, battery exemption
-# =====================================================================
-SERVICE_CLASS = "org.cipheraegis.enginecore.ServiceEngine"
-
-
-def _activity():
-    from jnius import autoclass
-    return autoclass("org.kivy.android.PythonActivity").mActivity
-
-
-def start_engine_service():
-    """Returns None on success, or a short error text."""
+def open_url(url):
     try:
-        from jnius import autoclass
-        autoclass(SERVICE_CLASS).start(_activity(), "")
-        return None
-    except Exception as first:
+        if platform == "android":
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        else:
+            import webbrowser
+            webbrowser.open(url)
+    except Exception:
         try:
-            from android import AndroidService
-            AndroidService(".engine", "Domain engine is running").start("")
-            return None
-        except Exception as second:
-            return f"{type(first).__name__}: {first} | {type(second).__name__}: {second}"[:200]
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
 
 
-def stop_engine_service():
-    try:
-        from jnius import autoclass
-        autoclass(SERVICE_CLASS).stop(_activity())
-        return None
-    except Exception as e:
-        return f"{type(e).__name__}: {e}"[:200]
-
-
-def request_notifications():
-    try:
-        from android.permissions import request_permissions
-        request_permissions(["android.permission.POST_NOTIFICATIONS"])
-    except Exception:
-        pass
-
-
-def battery_unrestricted():
-    """True if the app may run in the background without battery limits."""
-    try:
-        from jnius import autoclass
-        Context = autoclass("android.content.Context")
-        activity = _activity()
-        pm = activity.getSystemService(Context.POWER_SERVICE)
-        return bool(pm.isIgnoringBatteryOptimizations(activity.getPackageName()))
-    except Exception:
-        return True  # unknown: do not nag
-
-
-def request_battery_exemption():
-    try:
-        from jnius import autoclass
-        Intent = autoclass("android.content.Intent")
-        Settings = autoclass("android.provider.Settings")
-        Uri = autoclass("android.net.Uri")
-        activity = _activity()
-        intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-        intent.setData(Uri.parse("package:" + activity.getPackageName()))
-        activity.startActivity(intent)
-    except Exception:
-        pass
-
-
+# =====================================================================
+# WIDGETS
+# =====================================================================
 class GridBackground(Widget):
     """Faint cyan grid behind everything."""
     def __init__(self, **kw):
@@ -286,12 +208,54 @@ class Field(Panel):
         self.add_widget(self.input)
 
 
+class Bar(Widget):
+    def __init__(self, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(6))
+        super().__init__(**kw)
+        self._frac = 0.0
+        self._col = list(GOOD)
+        self.bind(pos=self._draw, size=self._draw)
+
+    def set(self, frac, color):
+        self._frac = max(0.0, min(1.0, frac))
+        self._col = list(color)
+        self._draw()
+
+    def _draw(self, *args):
+        self.canvas.clear()
+        with self.canvas:
+            Color(0.06, 0.12, 0.18, 1)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(3)])
+            Color(*self._col)
+            RoundedRectangle(pos=self.pos, size=(self.width * self._frac, self.height),
+                             radius=[dp(3)])
+
+
 class StatCard(Panel):
     def __init__(self, title, value, accent=ACCENT, **kw):
         super().__init__(orientation="vertical", padding=dp(10), spacing=dp(2), **kw)
         self.value_label = make_label(value, size=17, color=accent)
         self.add_widget(self.value_label)
         self.add_widget(make_label(title, size=10, color=MUTED))
+
+
+class MeterCard(Panel):
+    def __init__(self, title, **kw):
+        super().__init__(orientation="vertical", padding=dp(10), spacing=dp(3), **kw)
+        self.add_widget(make_label(title, size=10, color=MUTED))
+        self.value = make_label("--", size=16, color=ACCENT)
+        self.add_widget(self.value)
+        self.bar = Bar()
+        self.add_widget(self.bar)
+
+    def set(self, pct, text=None):
+        if pct is None:
+            self.value.text = text or "n/a"
+            self.bar.set(0, GOOD)
+        else:
+            self.value.text = text or f"{pct:.0f}%"
+            self.bar.set(pct / 100.0, level_color(pct))
 
 
 def unavailable_view(code=""):
@@ -330,21 +294,23 @@ class EnginePlatform(App):
         if IMPORT_ERROR:
             raise RuntimeError(IMPORT_ERROR)
 
-        if platform not in ("android", "ios"):
-            Window.size = (560, 860)
-        else:
+        self.phone = platform in ("android", "ios")
+        if self.phone:
             Window.softinput_mode = "below_target"
+        else:
+            Window.size = (860, 940)
 
         self._rendered_log_key = None
-
-        self.core = InfrastructureCore(self.post_log_message)
-        self.core.set_storage_path(default_registry_path())
-        data_folder = os.path.dirname(default_registry_path())
-        self.status_file = os.path.join(data_folder, "engine_status.json")
-        self._started_at = 0
-        self._engine_online = False
-        self._last_probe = 0
         self.status_labels = {}
+        self._fails = 0
+        self._locked_until = 0
+        self._last_snapshot = 0
+        self._entries_key = None
+        self.client = None
+        self._remote_state = None
+        self._remote_error = None
+        self._polling = False
+        self._poll_event = None
 
         root = FloatLayout()
         root.add_widget(GridBackground(size_hint=(1, 1)))
@@ -360,21 +326,24 @@ class EnginePlatform(App):
         outer.add_widget(self.shell)
         root.add_widget(outer)
 
-        self._fails = 0
-        self._locked_until = 0
-        self.auth_file = os.path.join(data_folder, "engine_auth.json")
-        self.auth = read_auth(self.auth_file)
-        if self.auth:
-            self.render_secure_gateway()
+        if self.phone:
+            self.render_connect()
         else:
-            self.render_setup()
+            self.core = InfrastructureCore(self.post_log_message)
+            self.core.set_storage_path(default_registry_path())
+            self.auth_file = self.core.auth_path()
+            self.auth = read_auth(self.auth_file)
+            if self.auth:
+                self.render_secure_gateway()
+            else:
+                self.render_setup()
         return root
 
     def _fit_width(self, window, width):
-        self.shell.width = min(width, dp(640))
+        self.shell.width = min(width, dp(640 if self.phone else 860))
 
     def on_pause(self):
-        return True  # keep running when the user switches apps
+        return True
 
     def on_resume(self):
         pass
@@ -385,12 +354,13 @@ class EnginePlatform(App):
         if len(self.log_buffer) > 40:
             self.log_buffer.pop(0)
 
-    # ---------------- LOGIN ----------------
+    # =================================================================
+    # DESKTOP: login / first-time setup
+    # =================================================================
     def render_secure_gateway(self):
         rw = self.shell
         rw.clear_widgets()
         rw.add_widget(BoxLayout(size_hint_y=0.2))
-
         rw.add_widget(make_label("> .engine", size=38, color=ACCENT, halign="center",
                                  size_hint_y=None, height=dp(60)))
         rw.add_widget(make_label("SECURE TERMINAL  //  AUTH REQUIRED", size=11, color=MUTED,
@@ -409,7 +379,6 @@ class EnginePlatform(App):
         panel.add_widget(NeonButton(text="[ UNLOCK ]", size_hint_y=None, height=dp(46),
                                     on_release=self.process_authorization))
         rw.add_widget(panel)
-
         rw.add_widget(BoxLayout(size_hint_y=0.45))
 
     @guarded
@@ -433,35 +402,10 @@ class EnginePlatform(App):
             self.auth_error.text = "ACCESS DENIED"
 
     def _enter_console(self):
-        if platform == "android":
-            request_notifications()
-            self._started_at = time.time()
-            err = start_engine_service()
-            if err:
-                record_error(self, err)
-                self.post_log_message("Background service unavailable.")
-            Clock.schedule_once(self._ask_battery, 2.0)
-        else:
-            self.core.start()
+        self.core.start()
         self.render_system_console()
         Clock.schedule_interval(self.update_telemetry_metrics, 0.5)
 
-    def _ask_battery(self, dt):
-        if not battery_unrestricted():
-            request_battery_exemption()
-
-    @guarded
-    def toggle_engine(self, instance):
-        if self._engine_online:
-            err = stop_engine_service()
-        else:
-            self._started_at = time.time()
-            err = start_engine_service()
-        if err:
-            record_error(self, err)
-            self.post_log_message("Service command failed.")
-
-    # ---------------- FIRST-TIME SETUP ----------------
     def render_setup(self):
         rw = self.shell
         rw.clear_widgets()
@@ -535,53 +479,66 @@ class EnginePlatform(App):
         self.auth = read_auth(self.auth_file)
         self._enter_console()
 
-    # ---------------- CONSOLE ----------------
+    # =================================================================
+    # DESKTOP: full console
+    # =================================================================
     def render_system_console(self):
         rw = self.shell
         rw.clear_widgets()
+        self._entries_key = None
 
-        header = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
-        header.add_widget(make_label("> .engine", size=24, color=ACCENT))
-        self.status_label = make_label("[ STARTING ]", size=12, color=WARN, halign="right",
-                                       size_hint_x=None, width=dp(104))
-        header.add_widget(self.status_label)
-        self.power_button = None
-        if platform == "android":
-            self.power_button = NeonButton(text="STOP", bg=DANGER, size_hint_x=None,
-                                           width=dp(64), font_size=sp(12),
-                                           on_release=self.toggle_engine)
-            header.add_widget(self.power_button)
-        rw.add_widget(header)
+        hero = Panel(orientation="horizontal", padding=[dp(16), dp(10)], spacing=dp(8),
+                     size_hint_y=None, height=dp(80))
+        left = BoxLayout(orientation="vertical")
+        left.add_widget(make_label("> .engine", size=26, color=ACCENT))
+        self.net_label = make_label("starting network...", size=10, color=MUTED, shorten=True)
+        left.add_widget(self.net_label)
+        hero.add_widget(left)
+        right = BoxLayout(orientation="vertical", spacing=dp(6),
+                          size_hint_x=None, width=dp(130))
+        self.status_label = make_label("[ ONLINE ]", size=12, color=GOOD, halign="right")
+        right.add_widget(self.status_label)
+        right.add_widget(NeonButton(text="DASHBOARD", font_size=sp(11), size_hint_y=None,
+                                    height=dp(32), on_release=self.open_dashboard))
+        hero.add_widget(right)
+        rw.add_widget(hero)
 
-        self.net_label = make_label("starting network...", size=11, color=MUTED,
-                                    size_hint_y=None, height=dp(18), shorten=True)
-        rw.add_widget(self.net_label)
-
-        stats = GridLayout(cols=3, spacing=dp(8), size_hint_y=None, height=dp(66))
-        self.traffic_card = StatCard("TRAFFIC", "0.0 KB", ACCENT)
+        stats = GridLayout(cols=3, spacing=dp(8), size_hint_y=None, height=dp(62))
+        self.traffic_card = StatCard("TRAFFIC", "0 B", ACCENT)
         self.requests_card = StatCard("REQUESTS", "0", WARN)
         self.tunnels_card = StatCard("TUNNELS", "0", GOOD)
         for c in (self.traffic_card, self.requests_card, self.tunnels_card):
             stats.add_widget(c)
         rw.add_widget(stats)
 
+        meters = GridLayout(cols=4, spacing=dp(8), size_hint_y=None, height=dp(78))
+        self.cpu_meter = MeterCard("CPU")
+        self.ram_meter = MeterCard("RAM")
+        self.gpu_meter = MeterCard("GPU")
+        self.disk_meter = MeterCard("DISK")
+        for m in (self.cpu_meter, self.ram_meter, self.gpu_meter, self.disk_meter):
+            meters.add_widget(m)
+        rw.add_widget(meters)
+
         bind_panel = Panel(orientation="vertical", padding=dp(12), spacing=dp(8),
-                           size_hint_y=None, height=dp(150))
+                           size_hint_y=None, height=dp(214))
         row = BoxLayout(spacing=dp(8), size_hint_y=None, height=dp(48))
         self.subdomain_field = Field(hint="name (e.g. shop)", size_hint_x=0.4)
         self.port_field = Field(hint="port / folder / blank", size_hint_x=0.6)
         row.add_widget(self.subdomain_field)
         row.add_widget(self.port_field)
         bind_panel.add_widget(row)
+        self.command_field = Field(hint="start command (optional): python app.py")
+        bind_panel.add_widget(self.command_field)
         bind_panel.add_widget(make_label(
-            "port = app you run   |   folder = site   |   blank = new site",
+            "port = app  |  folder = site  |  blank = new site  |  command = engine runs it",
             size=10, color=MUTED, size_hint_y=None, height=dp(16)))
         bind_panel.add_widget(NeonButton(text="[ REGISTER ]", size_hint_y=None, height=dp(46),
                                          on_release=self.execute_node_binding))
         rw.add_widget(bind_panel)
 
         self.nodes_tracker_label = make_label(
-            f"// REGISTERED  0/{MAX_APPS}", size=12, color=MUTED,
+            f"// SITES AND APPS  0/{MAX_APPS}", size=12, color=MUTED,
             size_hint_y=None, height=dp(22))
         rw.add_widget(self.nodes_tracker_label)
 
@@ -593,8 +550,7 @@ class EnginePlatform(App):
 
         rw.add_widget(make_label("// LIVE LOG", size=12, color=MUTED,
                                  size_hint_y=None, height=dp(22)))
-
-        log_panel = Panel(orientation="vertical", padding=dp(10), size_hint=(1, 0.45),
+        log_panel = Panel(orientation="vertical", padding=dp(10), size_hint=(1, 0.4),
                           border=BORDER_DIM)
         self.syslog_grid = GridLayout(cols=1, spacing=dp(2), size_hint_y=None)
         self.syslog_grid.bind(minimum_height=self.syslog_grid.setter("height"))
@@ -606,36 +562,37 @@ class EnginePlatform(App):
         self.refresh_routing_display_tree()
 
     @guarded
+    def open_dashboard(self, instance):
+        open_url(f"http://localhost:{self.core.admin_port or 9090}")
+
+    @guarded
     def execute_node_binding(self, instance):
-        name = self.subdomain_field.input.text.strip().lower().replace(".engine", "")
-        target = self.port_field.input.text.strip()
-
-        if not valid_name(name):
-            self.core.log("Name: letters, numbers and dashes only.")
-            return
-
-        if target == "":
-            ok, what = self.core.add_site(name), "site"
-        elif target.isdigit():
-            port_num = int(target)
-            if not (1024 <= port_num <= 65535):
-                self.core.log("Port must be between 1024 and 65535.")
-                return
-            ok, what = self.core.add_node(name, port_num), f"app on port {port_num}"
-        else:
-            folder = os.path.abspath(os.path.expanduser(target))
-            if not os.path.isdir(folder):
-                self.core.log("Folder not found.")
-                return
-            ok, what = self.core.add_site(name, folder), "site"
-
+        ok, message = self.core.register(
+            self.subdomain_field.input.text, self.port_field.input.text,
+            self.command_field.input.text)
+        self.core.log(message)
         if ok:
             self.subdomain_field.input.text = ""
             self.port_field.input.text = ""
+            self.command_field.input.text = ""
             self.refresh_routing_display_tree()
-            self.core.log(f"Registered {name}.engine ({what})")
-        else:
-            self.core.log("Limit reached: 15 entries maximum.")
+
+    @guarded
+    def execute_node_purge(self, subdomain):
+        self.core.drop_node(subdomain)
+        self.refresh_routing_display_tree()
+        self.core.log(f"Unbound {subdomain}.engine")
+
+    @guarded
+    def toggle_app(self, name):
+        procs = self.core.procs
+
+        def work():
+            if procs.is_running(name):
+                procs.stop(name)
+            else:
+                procs.start(name)
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------------- SITE EDITOR ----------------
     @guarded
@@ -673,7 +630,7 @@ class EnginePlatform(App):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(self.editor_input.text)
-        self.editor_msg.text = "Saved. Reload the page in Chrome."
+        self.editor_msg.text = "Saved. Reload the page in your browser."
         self.core.log(f"Saved {self._editing}.engine")
 
     @guarded
@@ -681,11 +638,10 @@ class EnginePlatform(App):
         self._rendered_log_key = None
         self.render_system_console()
 
-    @guarded
-    def execute_node_purge(self, subdomain):
-        self.core.drop_node(subdomain)
-        self.refresh_routing_display_tree()
-        self.core.log(f"Unbound {subdomain}.engine")
+    # ---------------- entries list ----------------
+    def _entry_line(self, cfg, label):
+        kind = "SITE" if cfg.get("type") == "site" else f"APP :{cfg.get('port')}"
+        return f"{kind}  |  {label}"
 
     def refresh_routing_display_tree(self):
         self.routing_grid.clear_widgets()
@@ -699,23 +655,30 @@ class EnginePlatform(App):
 
         for name, cfg in self.core.registry.items():
             is_site = cfg.get("type") == "site"
+            managed = bool(cfg.get("command"))
             row = Panel(orientation="horizontal", padding=[dp(14), dp(8)], spacing=dp(8),
                         size_hint_y=None, height=dp(84))
             info = BoxLayout(orientation="vertical")
             info.add_widget(make_label(f"{name}.engine", size=14, color=ACCENT))
             info.add_widget(make_label(self.core.url_for(name), size=11, color=MUTED,
                                        shorten=True))
-            state = make_label("...", size=11, color=MUTED)
+            label, ok = self.core.entry_status(name)
+            state = make_label(self._entry_line(cfg, label), size=11,
+                               color=GOOD if ok else WARN)
             self.status_labels[name] = state
             info.add_widget(state)
             row.add_widget(info)
 
             actions = BoxLayout(orientation="vertical", spacing=dp(6),
-                                size_hint_x=None, width=dp(78))
+                                size_hint_x=None, width=dp(86))
             if is_site:
                 actions.add_widget(NeonButton(
                     text="EDIT", font_size=sp(11),
                     on_release=lambda inst, n=name: self.open_editor(n)))
+            elif managed:
+                actions.add_widget(NeonButton(
+                    text="START/STOP", font_size=sp(10),
+                    on_release=lambda inst, n=name: self.toggle_app(n)))
             actions.add_widget(NeonButton(
                 text="UNBIND", bg=DANGER, font_size=sp(11),
                 on_release=lambda inst, n=name: self.execute_node_purge(n)))
@@ -723,85 +686,43 @@ class EnginePlatform(App):
             self.routing_grid.add_widget(row)
 
         self.nodes_tracker_label.text = (
-            f"// REGISTERED  {len(self.core.registry)}/{MAX_APPS}")
-        self._probe_apps()
+            f"// SITES AND APPS  {len(self.core.registry)}/{MAX_APPS}")
 
-    def _probe_apps(self):
-        """Sites: is the folder there? Apps: is the app really running on its port?"""
-        for name, cfg in self.core.registry.items():
-            label = self.status_labels.get(name)
-            if label is None:
-                continue
-            if cfg.get("type") == "site":
-                up = os.path.isdir(cfg.get("path", ""))
-                label.text = "SITE  |  " + ("LIVE" if up else "FOLDER MISSING")
-            else:
-                up = probe_port(cfg["port"])
-                label.text = f"APP :{cfg['port']}  |  " + ("LIVE" if up else "OFFLINE")
-            label.color = GOOD if up else WARN
-
-    def _read_stats(self):
-        if platform == "android":
-            data = None
-            try:
-                with open(self.status_file, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                pass
-            if data and time.time() - data.get("ts", 0) < 5:
-                data["online"] = True
-                data["starting"] = False
-                return data
-            data = data or {}
-            return {"online": False,
-                    "starting": time.time() - self._started_at < 20,
-                    "bytes": data.get("bytes", 0), "requests": data.get("requests", 0),
-                    "tunnels": 0, "proxy_port": data.get("proxy_port"),
-                    "dns_port": data.get("dns_port"),
-                    "lan_ip": data.get("lan_ip", self.core.lan_ip),
-                    "logs": data.get("logs", [])}
-        return {"online": True, "starting": False,
-                "bytes": self.core.bytes_transferred,
-                "requests": self.core.total_requests,
-                "tunnels": self.core.active_tunnels,
-                "proxy_port": self.core.proxy_port, "dns_port": self.core.dns_port,
-                "lan_ip": self.core.lan_ip, "logs": []}
+    def _apply_snapshot(self, snap):
+        self.net_label.text = (
+            f"proxy:{snap['proxy_port'] or '-'}  dns:{snap['dns_port'] or '-'}  "
+            f"dashboard:{snap['admin_port'] or '-'}  ip:{snap['lan_ip']}")
+        m = snap["metrics"]
+        self.cpu_meter.set(m["cpu"])
+        self.ram_meter.set(m["mem"]["percent"] if m["mem"] else None)
+        self.disk_meter.set(m["disk"]["percent"] if m["disk"] else None)
+        if m["gpus"]:
+            self.gpu_meter.set(m["gpus"][0]["util"])
+        else:
+            self.gpu_meter.set(None, "none")
+        key = tuple(sorted(e["name"] for e in snap["entries"]))
+        if key != self._entries_key:
+            self._entries_key = key
+            self.refresh_routing_display_tree()
+        for e in snap["entries"]:
+            label = self.status_labels.get(e["name"])
+            if label is not None:
+                label.text = self._entry_line(self.core.registry.get(e["name"], {}), e["status"])
+                label.color = GOOD if e["ok"] else WARN
 
     def update_telemetry_metrics(self, dt):
         try:
-            stats = self._read_stats()
-            b = stats["bytes"]
-            if b < 1024 * 1024:
-                metric = f"{round(b / 1024, 1)} KB"
-            else:
-                metric = f"{round(b / (1024 * 1024), 2)} MB"
-            self.traffic_card.value_label.text = metric
-            self.requests_card.value_label.text = str(stats["requests"])
-            self.tunnels_card.value_label.text = str(stats["tunnels"])
-            self.net_label.text = (
-                f"proxy:{stats['proxy_port'] or '-'}  dns:{stats['dns_port'] or '-'}"
-                f"  ip:{stats['lan_ip']}")
-
-            self._engine_online = stats["online"]
-            if stats["online"]:
-                self.status_label.text, self.status_label.color = "[ ONLINE ]", GOOD
-            elif stats["starting"]:
-                self.status_label.text, self.status_label.color = "[ STARTING ]", WARN
-            else:
-                self.status_label.text, self.status_label.color = "[ STOPPED ]", DANGER
-            if self.power_button is not None:
-                self.power_button.text = "STOP" if stats["online"] else "START"
-
-            if platform == "android" and stats["proxy_port"] != self.core.proxy_port:
-                self.core.proxy_port = stats["proxy_port"]
-                self.refresh_routing_display_tree()
+            core = self.core
+            self.traffic_card.value_label.text = fmt_bytes(core.bytes_transferred)
+            self.requests_card.value_label.text = str(core.total_requests)
+            self.tunnels_card.value_label.text = str(core.active_tunnels)
 
             now = time.time()
-            if now - self._last_probe >= 3:
-                self._last_probe = now
-                self._probe_apps()
+            if now - self._last_snapshot >= 2:
+                self._last_snapshot = now
+                self._apply_snapshot(core.snapshot())
 
-            merged = sorted(set(stats["logs"] + self.log_buffer))[-40:]
+            merged = sorted(set(self.log_buffer))[-40:]
             key = (len(merged), merged[-1] if merged else "")
             if key != self._rendered_log_key:
                 self._rendered_log_key = key
@@ -814,9 +735,244 @@ class EnginePlatform(App):
         except Exception:
             pass
 
+    # =================================================================
+    # PHONE: small companion (monitor the desktop engine, open sites)
+    # =================================================================
+    def _prefs_path(self):
+        return os.path.join(self.user_data_dir, "phone.json")
+
+    def _load_prefs(self):
+        try:
+            with open(self._prefs_path(), "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_prefs(self, data):
+        try:
+            with open(self._prefs_path(), "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def render_connect(self):
+        if self._poll_event is not None:
+            self._poll_event.cancel()
+            self._poll_event = None
+        rw = self.shell
+        rw.clear_widgets()
+        rw.add_widget(BoxLayout(size_hint_y=0.12))
+        rw.add_widget(make_label("> .engine", size=38, color=ACCENT, halign="center",
+                                 size_hint_y=None, height=dp(60)))
+        rw.add_widget(make_label("COMPANION  //  CONNECT TO YOUR ENGINE", size=11,
+                                 color=MUTED, halign="center", size_hint_y=None,
+                                 height=dp(22)))
+
+        panel = Panel(orientation="vertical", padding=dp(16), spacing=dp(10),
+                      size_hint_y=None, height=dp(274))
+        panel.add_widget(make_label("ENGINE ADDRESS", size=11, color=MUTED,
+                                    size_hint_y=None, height=dp(16)))
+        self.addr_field = Field(hint="192.168.1.20  or  host:9090")
+        self.addr_field.input.text = self._load_prefs().get("address", "")
+        panel.add_widget(self.addr_field)
+        panel.add_widget(make_label("ACCESS KEY", size=11, color=MUTED,
+                                    size_hint_y=None, height=dp(16)))
+        self.key_field = Field(hint="access key", password=True)
+        self.key_field.input.bind(on_text_validate=lambda inst: self.connect(None))
+        panel.add_widget(self.key_field)
+        self.connect_msg = make_label("", size=11, color=DANGER,
+                                      size_hint_y=None, height=dp(16))
+        panel.add_widget(self.connect_msg)
+        panel.add_widget(NeonButton(text="[ CONNECT ]", size_hint_y=None, height=dp(46),
+                                    on_release=self.connect))
+        rw.add_widget(panel)
+        rw.add_widget(make_label(
+            "The full engine runs on your computer.\n"
+            "This app monitors it and opens your sites.",
+            size=11, color=MUTED, halign="center", size_hint_y=None, height=dp(44)))
+        rw.add_widget(BoxLayout())
+
+    @guarded
+    def connect(self, instance):
+        address = self.addr_field.input.text.strip()
+        key = self.key_field.input.text
+        if not address or not key:
+            self.connect_msg.text = "Enter the address and your access key."
+            self.connect_msg.color = DANGER
+            return
+        self.connect_msg.text = "Connecting..."
+        self.connect_msg.color = MUTED
+
+        def work():
+            client, ok, err = None, False, ""
+            try:
+                client = RemoteClient(address)
+                ok, err = client.login(key)
+            except Exception:
+                err = ("Cannot reach the engine. Check the address and that "
+                       "your phone is on the same Wi-Fi.")
+            Clock.schedule_once(lambda dt: self._connected(client, address, ok, err), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _connected(self, client, address, ok, err):
+        if not ok:
+            self.connect_msg.text = err
+            self.connect_msg.color = DANGER
+            return
+        self.client = client
+        self._save_prefs({"address": address})
+        self._remote_state = None
+        self._remote_error = None
+        self._entries_key = None
+        self.render_phone_home()
+        self._poll_event = Clock.schedule_interval(self._phone_tick, 2.0)
+        self._phone_tick(0)
+
+    def render_phone_home(self):
+        rw = self.shell
+        rw.clear_widgets()
+
+        hero = Panel(orientation="horizontal", padding=[dp(16), dp(10)], spacing=dp(8),
+                     size_hint_y=None, height=dp(80))
+        left = BoxLayout(orientation="vertical")
+        left.add_widget(make_label("> .engine", size=26, color=ACCENT))
+        self.host_label = make_label("connecting...", size=10, color=MUTED, shorten=True)
+        left.add_widget(self.host_label)
+        hero.add_widget(left)
+        right = BoxLayout(orientation="vertical", spacing=dp(6),
+                          size_hint_x=None, width=dp(112))
+        self.status_label = make_label("[ ... ]", size=12, color=WARN, halign="right")
+        right.add_widget(self.status_label)
+        right.add_widget(NeonButton(text="LOCK", bg=MUTED, font_size=sp(11),
+                                    size_hint_y=None, height=dp(32),
+                                    on_release=self.disconnect))
+        hero.add_widget(right)
+        rw.add_widget(hero)
+
+        rw.add_widget(NeonButton(text="[ OPEN FULL DASHBOARD ]", size_hint_y=None,
+                                 height=dp(46), on_release=self.open_remote_dashboard))
+
+        stats = GridLayout(cols=3, spacing=dp(8), size_hint_y=None, height=dp(62))
+        self.live_card = StatCard("LIVE", "-", GOOD)
+        self.requests_card = StatCard("REQUESTS", "-", WARN)
+        self.traffic_card = StatCard("TRAFFIC", "-", ACCENT)
+        for c in (self.live_card, self.requests_card, self.traffic_card):
+            stats.add_widget(c)
+        rw.add_widget(stats)
+
+        meters = GridLayout(cols=3, spacing=dp(8), size_hint_y=None, height=dp(78))
+        self.cpu_meter = MeterCard("CPU")
+        self.ram_meter = MeterCard("RAM")
+        self.gpu_meter = MeterCard("GPU")
+        for m in (self.cpu_meter, self.ram_meter, self.gpu_meter):
+            meters.add_widget(m)
+        rw.add_widget(meters)
+
+        rw.add_widget(make_label("// SITES AND APPS", size=12, color=MUTED,
+                                 size_hint_y=None, height=dp(22)))
+        self.routing_grid = GridLayout(cols=1, spacing=dp(8), size_hint_y=None)
+        self.routing_grid.bind(minimum_height=self.routing_grid.setter("height"))
+        scroll = ScrollView(bar_width=0)
+        scroll.add_widget(self.routing_grid)
+        rw.add_widget(scroll)
+
+    @guarded
+    def disconnect(self, instance):
+        self.client = None
+        self.render_connect()
+
+    @guarded
+    def open_remote_dashboard(self, instance):
+        if self.client:
+            open_url(self.client.base)
+
+    def _phone_tick(self, dt):
+        if self.client is None:
+            return
+        if not self._polling:
+            self._polling = True
+            threading.Thread(target=self._phone_fetch, daemon=True).start()
+        self._apply_remote()
+
+    def _phone_fetch(self):
+        try:
+            status, body = self.client.state()
+            if status == 200:
+                self._remote_state = body
+                self._remote_error = None
+            elif status == 401:
+                self._remote_error = "SESSION"
+            else:
+                self._remote_error = "ERROR"
+        except Exception:
+            self._remote_error = "OFFLINE"
+        finally:
+            self._polling = False
+
+    def _apply_remote(self):
+        try:
+            if self._remote_error == "SESSION":
+                self.client = None
+                self.render_connect()
+                self.connect_msg.text = "Session ended. Connect again."
+                return
+            s = self._remote_state
+            if s is None or self._remote_error in ("OFFLINE", "ERROR"):
+                self.status_label.text = "[ OFFLINE ]" if s is not None else "[ ... ]"
+                self.status_label.color = DANGER if s is not None else WARN
+                return
+
+            host = urlparse(self.client.base).hostname
+            self.status_label.text = "[ CONNECTED ]"
+            self.status_label.color = GOOD
+            self.host_label.text = f"{host}  up {fmt_uptime(s['uptime'])}  v{s['version']}"
+
+            entries = s["entries"]
+            live = sum(1 for e in entries if e["ok"])
+            self.live_card.value_label.text = f"{live}/{len(entries)}"
+            self.requests_card.value_label.text = str(s["totals"]["requests"])
+            self.traffic_card.value_label.text = fmt_bytes(s["totals"]["bytes"])
+
+            m = s["metrics"]
+            self.cpu_meter.set(m["cpu"])
+            self.ram_meter.set(m["mem"]["percent"] if m["mem"] else None)
+            if m["gpus"]:
+                self.gpu_meter.set(m["gpus"][0]["util"])
+            else:
+                self.gpu_meter.set(None, "none")
+
+            key = tuple((e["name"], e["status"], e["type"]) for e in entries)
+            if key != self._entries_key:
+                self._entries_key = key
+                self._fill_phone_list(entries, host, s.get("proxy_port"))
+        except Exception:
+            pass
+
+    def _fill_phone_list(self, entries, host, proxy_port):
+        self.routing_grid.clear_widgets()
+        if not entries:
+            self.routing_grid.add_widget(make_label(
+                "nothing registered yet. add sites on your computer.",
+                size=12, color=MUTED, halign="center", size_hint_y=None, height=dp(60)))
+        for e in entries:
+            row = Panel(orientation="horizontal", padding=[dp(14), dp(8)], spacing=dp(8),
+                        size_hint_y=None, height=dp(72))
+            info = BoxLayout(orientation="vertical")
+            info.add_widget(make_label(f"{e['name']}.engine", size=14, color=ACCENT))
+            kind = "SITE" if e["type"] == "site" else f"APP :{e['port']}"
+            info.add_widget(make_label(f"{kind}  |  {e['status']}", size=11,
+                                       color=GOOD if e["ok"] else WARN))
+            row.add_widget(info)
+            url = f"http://{host}:{proxy_port}/_/{e['name']}/" if proxy_port else None
+            row.add_widget(NeonButton(
+                text="OPEN", font_size=sp(12), size_hint_x=None, width=dp(78),
+                on_release=lambda inst, u=url: open_url(u) if u else None))
+            self.routing_grid.add_widget(row)
+
     def on_stop(self):
-        if getattr(self, "core", None) is not None:
-            self.core.stop()
+        core = getattr(self, "core", None)
+        if core is not None:
+            core.stop()
 
 
 if __name__ == "__main__":
