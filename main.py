@@ -26,7 +26,7 @@ from kivy.utils import get_color_from_hex as hx, platform
 # If engine_core.py is missing from the APK, show the reason on screen
 # instead of closing silently.
 try:
-    from engine_core import InfrastructureCore, MAX_APPS, default_registry_path
+    from engine_core import InfrastructureCore, MAX_APPS, default_registry_path, probe_port
     IMPORT_ERROR = None
 except Exception:
     IMPORT_ERROR = traceback.format_exc()
@@ -131,6 +131,75 @@ def guarded(fn):
             self.post_log_message("Action could not be completed.")
     wrapper.__name__ = fn.__name__
     return wrapper
+
+
+# =====================================================================
+# ANDROID: background service, notifications, battery exemption
+# =====================================================================
+SERVICE_CLASS = "org.cipheraegis.enginecore.ServiceEngine"
+
+
+def _activity():
+    from jnius import autoclass
+    return autoclass("org.kivy.android.PythonActivity").mActivity
+
+
+def start_engine_service():
+    """Returns None on success, or a short error text."""
+    try:
+        from jnius import autoclass
+        autoclass(SERVICE_CLASS).start(_activity(), "")
+        return None
+    except Exception as first:
+        try:
+            from android import AndroidService
+            AndroidService(".engine", "Domain engine is running").start("")
+            return None
+        except Exception as second:
+            return f"{type(first).__name__}: {first} | {type(second).__name__}: {second}"[:200]
+
+
+def stop_engine_service():
+    try:
+        from jnius import autoclass
+        autoclass(SERVICE_CLASS).stop(_activity())
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"[:200]
+
+
+def request_notifications():
+    try:
+        from android.permissions import request_permissions
+        request_permissions(["android.permission.POST_NOTIFICATIONS"])
+    except Exception:
+        pass
+
+
+def battery_unrestricted():
+    """True if the app may run in the background without battery limits."""
+    try:
+        from jnius import autoclass
+        Context = autoclass("android.content.Context")
+        activity = _activity()
+        pm = activity.getSystemService(Context.POWER_SERVICE)
+        return bool(pm.isIgnoringBatteryOptimizations(activity.getPackageName()))
+    except Exception:
+        return True  # unknown: do not nag
+
+
+def request_battery_exemption():
+    try:
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
+        Settings = autoclass("android.provider.Settings")
+        Uri = autoclass("android.net.Uri")
+        activity = _activity()
+        intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        intent.setData(Uri.parse("package:" + activity.getPackageName()))
+        activity.startActivity(intent)
+    except Exception:
+        pass
 
 
 class GridBackground(Widget):
@@ -268,10 +337,13 @@ class EnginePlatform(App):
         self._rendered_log_key = None
 
         self.core = InfrastructureCore(self.post_log_message)
-        if platform == "android":
-            self.core.set_storage_path(os.path.join(self.user_data_dir, "engine_registry.json"))
-        else:
-            self.core.set_storage_path(default_registry_path())
+        self.core.set_storage_path(default_registry_path())
+        data_folder = os.path.dirname(default_registry_path())
+        self.status_file = os.path.join(data_folder, "engine_status.json")
+        self._started_at = 0
+        self._engine_online = False
+        self._last_probe = 0
+        self.status_labels = {}
 
         root = FloatLayout()
         root.add_widget(GridBackground(size_hint=(1, 1)))
@@ -289,9 +361,7 @@ class EnginePlatform(App):
 
         self._fails = 0
         self._locked_until = 0
-        base = (self.user_data_dir if platform == "android"
-                else os.path.dirname(default_registry_path()))
-        self.auth_file = os.path.join(base, "engine_auth.json")
+        self.auth_file = os.path.join(data_folder, "engine_auth.json")
         self.auth = read_auth(self.auth_file)
         if self.auth:
             self.render_secure_gateway()
@@ -362,9 +432,33 @@ class EnginePlatform(App):
             self.auth_error.text = "ACCESS DENIED"
 
     def _enter_console(self):
-        self.core.start()
+        if platform == "android":
+            request_notifications()
+            self._started_at = time.time()
+            err = start_engine_service()
+            if err:
+                record_error(self, err)
+                self.post_log_message("Background service unavailable.")
+            Clock.schedule_once(self._ask_battery, 2.0)
+        else:
+            self.core.start()
         self.render_system_console()
         Clock.schedule_interval(self.update_telemetry_metrics, 0.5)
+
+    def _ask_battery(self, dt):
+        if not battery_unrestricted():
+            request_battery_exemption()
+
+    @guarded
+    def toggle_engine(self, instance):
+        if self._engine_online:
+            err = stop_engine_service()
+        else:
+            self._started_at = time.time()
+            err = start_engine_service()
+        if err:
+            record_error(self, err)
+            self.post_log_message("Service command failed.")
 
     # ---------------- FIRST-TIME SETUP ----------------
     def render_setup(self):
@@ -445,10 +539,17 @@ class EnginePlatform(App):
         rw = self.shell
         rw.clear_widgets()
 
-        header = BoxLayout(size_hint_y=None, height=dp(40))
+        header = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
         header.add_widget(make_label("> .engine", size=24, color=ACCENT))
-        header.add_widget(make_label("[ ONLINE ]", size=12, color=GOOD, halign="right",
-                                     size_hint_x=0.4))
+        self.status_label = make_label("[ STARTING ]", size=12, color=WARN, halign="right",
+                                       size_hint_x=None, width=dp(104))
+        header.add_widget(self.status_label)
+        self.power_button = None
+        if platform == "android":
+            self.power_button = NeonButton(text="STOP", bg=DANGER, size_hint_x=None,
+                                           width=dp(64), font_size=sp(12),
+                                           on_release=self.toggle_engine)
+            header.add_widget(self.power_button)
         rw.add_widget(header)
 
         self.net_label = make_label("starting network...", size=11, color=MUTED,
@@ -530,6 +631,7 @@ class EnginePlatform(App):
 
     def refresh_routing_display_tree(self):
         self.routing_grid.clear_widgets()
+        self.status_labels = {}
 
         if not self.core.registry:
             self.routing_grid.add_widget(make_label(
@@ -538,7 +640,7 @@ class EnginePlatform(App):
                 size_hint_y=None, height=dp(60)))
 
         for subdomain, config in self.core.registry.items():
-            row = Panel(orientation="horizontal", padding=[dp(14), dp(8)], spacing=dp(10),
+            row = Panel(orientation="horizontal", padding=[dp(14), dp(8)], spacing=dp(8),
                         size_hint_y=None, height=dp(60))
             info = BoxLayout(orientation="vertical")
             info.add_widget(make_label(f"{subdomain}.engine", size=14, color=ACCENT))
@@ -546,34 +648,97 @@ class EnginePlatform(App):
                 f"{self.core.url_for(subdomain)}  >  :{config['port']}",
                 size=11, color=MUTED, shorten=True))
             row.add_widget(info)
+            state = make_label("...", size=11, color=MUTED, halign="center",
+                               size_hint_x=None, width=dp(64))
+            self.status_labels[subdomain] = state
+            row.add_widget(state)
             row.add_widget(NeonButton(
-                text="UNBIND", bg=DANGER, fg=BG, size_hint_x=None, width=dp(84),
+                text="UNBIND", bg=DANGER, fg=BG, size_hint_x=None, width=dp(76),
                 font_size=sp(11),
                 on_release=lambda inst, s=subdomain: self.execute_node_purge(s)))
             self.routing_grid.add_widget(row)
 
         self.nodes_tracker_label.text = (
             f"// REGISTERED APPS  {len(self.core.registry)}/{MAX_APPS}")
+        self._probe_apps()
+
+    def _probe_apps(self):
+        """Checks whether each registered app is actually running on its port."""
+        for name, cfg in self.core.registry.items():
+            label = self.status_labels.get(name)
+            if label is None:
+                continue
+            up = probe_port(cfg["port"])
+            label.text = "LIVE" if up else "OFFLINE"
+            label.color = GOOD if up else WARN
+
+    def _read_stats(self):
+        if platform == "android":
+            data = None
+            try:
+                with open(self.status_file, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+            if data and time.time() - data.get("ts", 0) < 5:
+                data["online"] = True
+                data["starting"] = False
+                return data
+            data = data or {}
+            return {"online": False,
+                    "starting": time.time() - self._started_at < 20,
+                    "bytes": data.get("bytes", 0), "requests": data.get("requests", 0),
+                    "tunnels": 0, "proxy_port": data.get("proxy_port"),
+                    "dns_port": data.get("dns_port"),
+                    "lan_ip": data.get("lan_ip", self.core.lan_ip),
+                    "logs": data.get("logs", [])}
+        return {"online": True, "starting": False,
+                "bytes": self.core.bytes_transferred,
+                "requests": self.core.total_requests,
+                "tunnels": self.core.active_tunnels,
+                "proxy_port": self.core.proxy_port, "dns_port": self.core.dns_port,
+                "lan_ip": self.core.lan_ip, "logs": []}
 
     def update_telemetry_metrics(self, dt):
         try:
-            b = self.core.bytes_transferred
+            stats = self._read_stats()
+            b = stats["bytes"]
             if b < 1024 * 1024:
                 metric = f"{round(b / 1024, 1)} KB"
             else:
                 metric = f"{round(b / (1024 * 1024), 2)} MB"
             self.traffic_card.value_label.text = metric
-            self.requests_card.value_label.text = str(self.core.total_requests)
-            self.tunnels_card.value_label.text = str(self.core.active_tunnels)
+            self.requests_card.value_label.text = str(stats["requests"])
+            self.tunnels_card.value_label.text = str(stats["tunnels"])
             self.net_label.text = (
-                f"proxy:{self.core.proxy_port or '-'}  dns:{self.core.dns_port or '-'}"
-                f"  ip:{self.core.lan_ip}")
+                f"proxy:{stats['proxy_port'] or '-'}  dns:{stats['dns_port'] or '-'}"
+                f"  ip:{stats['lan_ip']}")
 
-            key = (len(self.log_buffer), self.log_buffer[-1] if self.log_buffer else "")
+            self._engine_online = stats["online"]
+            if stats["online"]:
+                self.status_label.text, self.status_label.color = "[ ONLINE ]", GOOD
+            elif stats["starting"]:
+                self.status_label.text, self.status_label.color = "[ STARTING ]", WARN
+            else:
+                self.status_label.text, self.status_label.color = "[ STOPPED ]", DANGER
+            if self.power_button is not None:
+                self.power_button.text = "STOP" if stats["online"] else "START"
+
+            if platform == "android" and stats["proxy_port"] != self.core.proxy_port:
+                self.core.proxy_port = stats["proxy_port"]
+                self.refresh_routing_display_tree()
+
+            now = time.time()
+            if now - self._last_probe >= 3:
+                self._last_probe = now
+                self._probe_apps()
+
+            merged = sorted(set(stats["logs"] + self.log_buffer))[-40:]
+            key = (len(merged), merged[-1] if merged else "")
             if key != self._rendered_log_key:
                 self._rendered_log_key = key
                 self.syslog_grid.clear_widgets()
-                for entry in reversed(self.log_buffer):
+                for entry in reversed(merged):
                     self.syslog_grid.add_widget(make_label(
                         "> " + entry, size=10, color=MUTED,
                         size_hint_y=None, height=dp(20),
