@@ -67,6 +67,72 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-cache-
 
+      # Build-time guard: the app imports engine_core.py, so it must be in the repo
+      - name: Check required source files
+        run: |
+          for f in main.py engine_core.py buildozer.spec; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing $f in the repository root. Upload it and run again."
+              exit 1
+            fi
+          done
+
+      # Replaces the default Kivy loading screen with a branded one
+      - name: Prepare launch screen
+        run: |
+          python3 -m pip install pillow
+          python3 - <<'EOF'
+          import os
+          from PIL import Image, ImageDraw, ImageFont
+
+          if os.path.exists("presplash.png"):
+              print("presplash.png already present")
+              raise SystemExit
+
+          S = 1024
+          bg, accent, muted = (5, 8, 15), (0, 240, 255), (95, 122, 148)
+          img = Image.new("RGB", (S, S), bg)
+          d = ImageDraw.Draw(img)
+
+          for p in range(0, S, 48):
+              d.line([(p, 0), (p, S)], fill=(8, 22, 32))
+              d.line([(0, p), (S, p)], fill=(8, 22, 32))
+
+          def font(size):
+              for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+                           "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"):
+                  if os.path.exists(path):
+                      return ImageFont.truetype(path, size)
+              return ImageFont.load_default(size)
+
+          def centered(text, y, fnt, fill):
+              w = d.textlength(text, font=fnt)
+              d.text(((S - w) / 2, y), text, font=fnt, fill=fill)
+
+          centered("> .engine", 400, font(150), accent)
+          centered("DOMAIN HOSTING CONSOLE", 600, font(34), muted)
+          d.rectangle([312, 680, 712, 686], fill=(10, 40, 52))
+          d.rectangle([312, 680, 512, 686], fill=accent)
+          img.save("presplash.png", optimize=True)
+          print("generated presplash.png")
+          EOF
+          python3 - <<'EOF'
+          import re
+          p = "buildozer.spec"
+          s = open(p).read()
+          def setkey(key, val):
+              global s
+              pat = r"^" + re.escape(key) + r"\s*=.*$"
+              if re.search(pat, s, re.M):
+                  s = re.sub(pat, key + " = " + val, s, flags=re.M)
+              else:
+                  s = re.sub(r"^\[app\]\s*$", "[app]\n" + key + " = " + val, s, count=1, flags=re.M)
+          setkey("presplash.filename", "presplash.png")
+          setkey("android.presplash_color", "#05080F")
+          open(p, "w").write(s)
+          EOF
+          grep -n "presplash" buildozer.spec
+
       # buildozer.spec points at icon.png; create a placeholder if the repo has none
       - name: Ensure icon.png exists
         run: |
