@@ -1,6 +1,7 @@
 # Linux server: run .engine 24/7 and restart it if it ever stops.
 #   sudo mkdir -p /opt/engine /var/lib/engine
-#   sudo cp main.py engine_core.py engine_infra.py engine_admin.py /opt/engine/
+#   sudo cp engine_*.py /opt/engine/
+#   sudo pip3 install cryptography
 #   sudo useradd --system engine && sudo chown engine /var/lib/engine
 #   sudo -u engine ENGINE_DATA=/var/lib/engine python3 /opt/engine/engine_core.py setpassword
 #   sudo cp deploy/engine.service /etc/systemd/system/
