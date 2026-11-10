@@ -51,6 +51,14 @@ def hash_password(pw, salt_hex, iterations=ITERATIONS):
                                iterations).hex()
 
 
+def secure_file(path):
+    """Owner-only permissions for files that hold secrets (no effect on Windows)."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def read_auth(path):
     try:
         with open(path, "r") as f:
@@ -68,6 +76,7 @@ def write_auth(path, pw):
             "hash": hash_password(pw, salt, ITERATIONS)}
     with open(path, "w") as f:
         json.dump(data, f)
+    secure_file(path)
     return data
 
 
@@ -365,44 +374,95 @@ class ProcessManager:
 # =====================================================================
 # REMOTE CLIENT (phone -> desktop engine)
 # =====================================================================
-def normalize_base(address):
+def split_address(address):
+    """'192.168.1.20' or 'pc:9090' or 'https://pc:9443' -> (scheme or None, host, port or None)."""
     address = address.strip().rstrip("/")
-    if not address.startswith("http"):
-        address = "http://" + address
-    host_part = address.split("//", 1)[1]
-    if ":" not in host_part:
-        address += ":9090"
-    return address
+    scheme = None
+    if "://" in address:
+        scheme, address = address.split("://", 1)
+    host, _, port = address.partition(":")
+    return scheme, host, (int(port) if port.isdigit() else None)
+
+
+def normalize_base(address):
+    scheme, host, port = split_address(address)
+    return f"{scheme or 'http'}://{host}:{port or 9090}"
+
+
+class CertificateChanged(Exception):
+    pass
 
 
 class RemoteClient:
-    def __init__(self, address):
-        self.base = normalize_base(address)
-        self.token = None
+    """Phone -> desktop engine. Tries HTTPS first (port 9443) and remembers the
+    server's certificate fingerprint the first time (trust on first use); if the
+    certificate later changes, it refuses to talk. Falls back to plain HTTP."""
 
-    def _request(self, path, payload=None, timeout=6):
-        data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(self.base + path, data=data,
-                                     method="POST" if payload is not None else "GET")
-        req.add_header("Content-Type", "application/json")
+    def __init__(self, address, pin=None):
+        scheme, host, port = split_address(address)
+        self.host = host
+        if scheme or port:
+            self.candidates = [f"{scheme or 'http'}://{host}:{port or (9443 if scheme == 'https' else 9090)}"]
+        else:
+            self.candidates = [f"https://{host}:9443", f"http://{host}:9090"]
+        self.base = self.candidates[0]
+        self.token = None
+        self.pin = pin
+
+    def _request_to(self, base, path, payload=None, timeout=6):
+        import http.client
+        import ssl
+        from urllib.parse import urlparse
+        u = urlparse(base)
+        headers = {"Content-Type": "application/json"}
         if self.token:
-            req.add_header("Authorization", "Bearer " + self.token)
+            headers["Authorization"] = "Bearer " + self.token
+        data = json.dumps(payload).encode() if payload is not None else None
+        if u.scheme == "https":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE  # identity is checked by the pinned fingerprint
+            conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=ctx)
+            conn.connect()
+            fingerprint = hashlib.sha256(conn.sock.getpeercert(True)).hexdigest()
+            if self.pin and fingerprint != self.pin:
+                conn.close()
+                raise CertificateChanged("The engine's certificate changed. If you did not "
+                                         "expect this, someone may be impersonating it.")
+            self.pin = self.pin or fingerprint
+        else:
+            conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, json.loads(r.read().decode() or "{}")
-        except urllib.error.HTTPError as e:
+            conn.request("POST" if payload is not None else "GET", path, body=data, headers=headers)
+            r = conn.getresponse()
+            raw = r.read().decode() or "{}"
             try:
-                body = json.loads(e.read().decode() or "{}")
+                body = json.loads(raw)
             except Exception:
                 body = {}
-            return e.code, body
+            return r.status, body
+        finally:
+            conn.close()
+
+    def _request(self, path, payload=None, timeout=6):
+        return self._request_to(self.base, path, payload, timeout)
 
     def login(self, password):
-        status, body = self._request("/api/login", {"password": password})
-        if status == 200 and body.get("token"):
-            self.token = body["token"]
-            return True, ""
-        return False, body.get("error", "Login failed.")
+        last = None
+        for base in self.candidates:
+            try:
+                status, body = self._request_to(base, "/api/login", {"password": password})
+            except CertificateChanged:
+                raise  # a changed certificate is never silently bypassed
+            except Exception as e:
+                last = e
+                continue
+            self.base = base
+            if status == 200 and body.get("token"):
+                self.token = body["token"]
+                return True, ""
+            return False, body.get("error", "Login failed.")
+        raise last or ConnectionError("Cannot reach the engine.")
 
     def state(self):
-        return self._request("/api/state")
+        return self._request("/api/state?limit=200")
