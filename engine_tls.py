@@ -4,9 +4,8 @@
 - A private certificate authority (CA) is created on first use.
 - A certificate is issued for each site name on demand (SNI), so thousands of
   names do not need one giant certificate.
-- To use a real certificate (for example from Let's Encrypt) for a public
-  domain, drop  tls/custom/<host>.crt  and  tls/custom/<host>.key  and it is
-  used for that host instead.
+- A certificate placed in  tls/custom/<host>.crt  and  tls/custom/<host>.key
+  is used for exactly that host name instead of a generated one.
 - Browsers and customer servers must trust  tls/ca.crt  once (downloadable
   from the dashboard) to see a padlock instead of a warning.
 """
@@ -138,6 +137,10 @@ class TLSManager:
             f.write(key.private_bytes(serialization.Encoding.PEM,
                                       serialization.PrivateFormat.PKCS8,
                                       serialization.NoEncryption()))
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass
         with open(crt, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
         return crt, key_path
