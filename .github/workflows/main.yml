@@ -59,7 +59,6 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install "buildozer==1.5.0" "cython==0.29.36" virtualenv
 
-      # Restore compiler cache architecture
       - name: Restore Compiler Cache Architecture
         uses: actions/cache@v4
         with:
@@ -71,7 +70,7 @@ jobs:
       # Build-time guard: the app imports engine_core.py, so it must be in the repo
       - name: Check required source files
         run: |
-          for f in main.py engine_core.py engine_infra.py engine_admin.py buildozer.spec; do
+          for f in main.py engine_core.py engine_infra.py engine_admin.py engine_accounts.py engine_tls.py engine_dashboard.py buildozer.spec; do
             if [ ! -f "$f" ]; then
               echo "::error::Missing $f in the repository root. Upload it and run again."
               exit 1
