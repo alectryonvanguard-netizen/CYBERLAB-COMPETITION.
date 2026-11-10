@@ -1,23 +1,54 @@
 """
-.engine admin server: JSON API + full web dashboard.
+.engine admin server: JSON API + web dashboard, over HTTPS when available.
 
-Opens at http://<this-machine>:9090 and needs the access key. It is the
-complete control surface (register, edit, start/stop, logs, GPU, metrics) and
-is also what the phone companion talks to.
+Roles
+  admin     the owner (access key): everything.
+  customer  a hosting customer (username + password): only their own reports,
+            servers and private messages.
+  node      a customer's small server (token): reports in, quota and messages out.
 """
 import os
+import ssl
 import json
 import time
+import base64
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from engine_infra import read_auth, check_auth, tail_file, MAX_FAILS, LOCK_SECONDS
+from engine_infra import (read_auth, write_auth, check_auth, tail_file, password_checks,
+                          MAX_FAILS, LOCK_SECONDS)
+from engine_dashboard import DASHBOARD_HTML
 
 ADMIN_PORTS = (9090, 9091, 9092)
+ADMIN_HTTPS_PORTS = (9443, 9444, 9445)
 TOKEN_TTL = 12 * 3600
+MAX_BODY = 3_000_000
 MAX_PAGE_BYTES = 2_000_000
+
+
+class TLSServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, handler, ctx):
+        super().__init__(addr, handler)
+        self.ctx = ctx
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        sock.settimeout(10)
+        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+    def handle_error(self, request, client_address):
+        pass  # failed handshakes and resets are normal on the internet
+
+
+class QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass
 
 
 class AdminServer:
@@ -26,13 +57,16 @@ class AdminServer:
         self.tokens = {}
         self.fails = {}
         self.httpd = None
+        self.https_httpd = None
+        self.https_port = None
         self.lock = threading.Lock()
 
+    # --------------------------------------------------------------- start
     def start(self):
         handler = self._make_handler()
-        for port in ADMIN_PORTS:
+        for port in (self.core.ports.get("admin") or ADMIN_PORTS):
             try:
-                self.httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
+                self.httpd = QuietServer(("0.0.0.0", port), handler)
                 self.core.admin_port = port
                 break
             except OSError:
@@ -40,432 +74,497 @@ class AdminServer:
         if self.httpd is None:
             self.core.log("Dashboard could not bind a port.")
             return
-        self.httpd.daemon_threads = True
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-        self.core.log(f"Dashboard on port {self.core.admin_port}: "
-                      f"http://localhost:{self.core.admin_port}")
+
+        ctx = None
+        try:
+            ctx = self.core.tls_server_context()
+        except Exception as e:
+            self.core.log(f"HTTPS for the dashboard failed: {e}")
+        if ctx is not None:
+            for port in (self.core.ports.get("admin_https") or ADMIN_HTTPS_PORTS):
+                try:
+                    self.https_httpd = TLSServer(("0.0.0.0", port), handler, ctx)
+                    self.https_port = port
+                    break
+                except OSError:
+                    continue
+            if self.https_httpd:
+                threading.Thread(target=self.https_httpd.serve_forever, daemon=True).start()
+        if self.https_port:
+            self.core.log(f"Dashboard (secure): https://localhost:{self.https_port}")
+        self.core.log(f"Dashboard: http://localhost:{self.core.admin_port}"
+                      + (" (this computer only; others use HTTPS)" if self.https_port else ""))
 
     def stop(self):
-        if self.httpd:
-            try:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-            except Exception:
-                pass
+        for srv in (self.httpd, self.https_httpd):
+            if srv:
+                try:
+                    srv.shutdown()
+                    srv.server_close()
+                except Exception:
+                    pass
 
-    # ---------------------------------------------------------- auth
-    def login(self, ip, password):
+    # ---------------------------------------------------------------- auth
+    def _locked(self, key):
+        _count, until = self.fails.get(key, (0, 0))
+        return until if time.time() < until else 0
+
+    def _fail(self, key):
+        count, _ = self.fails.get(key, (0, 0))
+        count += 1
+        if count >= MAX_FAILS:
+            self.fails[key] = (0, time.time() + LOCK_SECONDS)
+        else:
+            self.fails[key] = (count, 0)
+
+    def login(self, ip, username, password):
+        username = (username or "").strip().lower()
+        key = (username or "admin", ip)
         now = time.time()
         with self.lock:
-            count, locked_until = self.fails.get(ip, (0, 0))
-            if now < locked_until:
-                return 429, {"error": f"Too many attempts. Try again in {int(locked_until - now) + 1}s."}
-            auth = read_auth(self.core.auth_path())
-            if not auth:
-                return 503, {"error": "No access key yet. Create it in the app, or run: "
-                                      "python engine_core.py setpassword"}
-            if check_auth(auth, password or ""):
-                self.fails.pop(ip, None)
-                self.tokens = {t: e for t, e in self.tokens.items() if e > now}
-                token = secrets.token_urlsafe(24)
-                self.tokens[token] = now + TOKEN_TTL
-                return 200, {"token": token}
-            count += 1
-            if count >= MAX_FAILS:
-                self.fails[ip] = (0, now + LOCK_SECONDS)
+            until = self._locked(key)
+            if until:
+                return 429, {"error": f"Too many attempts. Try again in {int(until - now) + 1}s."}
+            if not username:  # owner access key
+                auth = read_auth(self.core.auth_path())
+                if not auth:
+                    return 503, {"error": "No access key yet. Create it in the app, or run: "
+                                          "python engine_core.py setpassword"}
+                if not check_auth(auth, password or ""):
+                    self._fail(key)
+                    self.core.store.audit("admin", "login_failed", "", ip)
+                    return 401, {"error": "Wrong access key."}
+                session = {"role": "admin", "uid": None, "user": "admin"}
             else:
-                self.fails[ip] = (count, 0)
-            return 401, {"error": "Wrong access key."}
+                user, err = self.core.store.verify_user(username, password or "")
+                if not user:
+                    self._fail(key)
+                    self.core.store.audit(username, "login_failed", err, ip)
+                    return 401, {"error": err}
+                session = {"role": "customer", "uid": user["id"], "user": user["username"]}
+            self.fails.pop(key, None)
+            self.tokens = {t: s for t, s in self.tokens.items() if s["exp"] > now}
+            token = secrets.token_urlsafe(24)
+            self.tokens[token] = {**session, "exp": now + TOKEN_TTL}
+        self.core.store.audit(session["user"], "login", session["role"], ip)
+        return 200, {"token": token, "role": session["role"], "username": session["user"]}
 
-    def valid_token(self, token):
+    def session(self, token):
         with self.lock:
-            return self.tokens.get(token, 0) > time.time()
+            s = self.tokens.get(token)
+            if s and s["exp"] > time.time():
+                return s
+        return None
 
-    # ---------------------------------------------------------- handler
+    def drop_sessions(self, uid=None, role=None):
+        with self.lock:
+            self.tokens = {t: s for t, s in self.tokens.items()
+                           if not ((uid is not None and s["uid"] == uid) or (role and s["role"] == role))}
+
+    def join_code(self, token):
+        core = self.core
+        host = core.settings.get("public_host") or core.lan_ip
+        if self.https_port and core.tls.available:
+            url, ca = f"https://{host}:{self.https_port}", core.tls.ca_pem().decode()
+        else:
+            url, ca = f"http://{host}:{core.admin_port}", ""
+        raw = json.dumps({"u": url, "t": token, "ca": ca}).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    # --------------------------------------------------------------- logic
+    def _scope(self, scope):
+        scope = scope or "local"
+        if scope == "local":
+            return None, "local"
+        if scope == "all":
+            return None, None
+        kind, _, ident = scope.partition(":")
+        if kind == "user" and ident.isdigit():
+            return int(ident), None
+        if kind == "node" and ident:
+            return None, ident
+        return None, "local"
+
+    def _logs(self, name, lines):
+        core = self.core
+        if name == "engine":
+            return "\n".join(core.log_ring[-lines:])
+        if name == "access":
+            return tail_file(os.path.join(core.data_dir(), "logs", "access.log"), lines)
+        if name in core.registry and core.procs:
+            return tail_file(core.procs.log_path(name), lines)
+        return ""
+
+    def handle(self, method, path, query, body, ip, sess, node_token):
+        """Returns (status, object). Called by the HTTP handler."""
+        core, store = self.core, self.core.store
+
+        def q(k, d=""):
+            return (query.get(k) or [d])[0]
+
+        # ---- node endpoints (token of a customer's small server)
+        if path == "/api/node/heartbeat" and method == "POST":
+            node = store.node_by_token(node_token)
+            if not node:
+                return 401, {"error": "Unknown server token."}
+            return 200, store.heartbeat(node, body, ip)
+        if path == "/api/node/report" and method == "GET":
+            node = store.node_by_token(node_token)
+            if not node:
+                return 401, {"error": "Unknown server token."}
+            rep = store.report(q("period", "week"), node_id=node["id"])
+            user = store.get_user(node["user_id"]) or {}
+            rep["user"] = {"username": user.get("username"), "quota_mb": user.get("quota_mb"),
+                           "status": user.get("status")}
+            rep["messages"] = store.inbox(node["user_id"], limit=10)
+            rep["heat"] = store.heat(node_id=node["id"])
+            return 200, rep
+
+        if path == "/api/login" and method == "POST":
+            return self.login(ip, body.get("username"), body.get("password"))
+
+        if not sess:
+            return 401, {"error": "Not signed in."}
+        role, uid = sess["role"], sess["uid"]
+
+        # ---------------------------------------------------- customer portal
+        if path.startswith("/api/portal/"):
+            if role != "customer":
+                return 403, {"error": "Customer area."}
+            sub = path[len("/api/portal/"):]
+            user = store.get_user(uid)
+            if not user:
+                return 401, {"error": "Account no longer exists."}
+            if sub == "overview" and method == "GET":
+                nodes = store.list_nodes(uid)
+                for n in nodes:
+                    n.pop("sites", None)
+                return 200, {"user": user, "nodes": nodes, "unread": store.unread_count(uid),
+                             "storage_bytes": store.user_storage(uid),
+                             "quota_bytes": user["quota_mb"] * 1024 * 1024}
+            if sub == "report" and method == "GET":
+                rep = store.report(q("period", "week"), user_id=uid)
+                rep["heat"] = store.heat(user_id=uid)
+                return 200, rep
+            if sub == "messages" and method == "GET":
+                return 200, {"messages": store.inbox(uid, limit=100)}
+            if sub == "messages/read" and method == "POST":
+                store.mark_read(uid, [int(i) for i in body.get("ids", []) if str(i).isdigit()])
+                return 200, {"ok": True}
+            if sub == "node/create" and method == "POST":
+                nid, token, err = store.create_node(uid, str(body.get("name", "my-server")))
+                if err:
+                    return 400, {"error": err}
+                store.audit(user["username"], "node_create", nid, ip)
+                return 200, {"id": nid, "token": token, "join_code": self.join_code(token)}
+            if sub == "node/reset" and method == "POST":
+                node = store.get_node(str(body.get("id", "")))
+                if not node or node["user_id"] != uid:
+                    return 404, {"error": "No such server."}
+                token = store.reset_node_token(node["id"])
+                store.audit(user["username"], "node_reset", node["id"], ip)
+                return 200, {"id": node["id"], "token": token, "join_code": self.join_code(token)}
+            if sub == "node/delete" and method == "POST":
+                node = store.get_node(str(body.get("id", "")))
+                if not node or node["user_id"] != uid:
+                    return 404, {"error": "No such server."}
+                store.delete_node(node["id"])
+                store.audit(user["username"], "node_delete", node["id"], ip)
+                return 200, {"ok": True}
+            if sub == "password" and method == "POST":
+                good, _err = store.verify_user(user["username"], str(body.get("current", "")))
+                if not good:
+                    return 400, {"error": "Current password is wrong."}
+                ok, err = store.set_password(uid, str(body.get("new", "")))
+                if not ok:
+                    return 400, {"error": err}
+                store.audit(user["username"], "password_change", "", ip)
+                return 200, {"ok": True}
+            return 404, {"error": "Not found."}
+
+        # -------------------------------------------------------- admin only
+        if role != "admin":
+            return 403, {"error": "Owner area."}
+
+        if path == "/api/state" and method == "GET":
+            limit = min(int(q("limit", "100") or 100), 500)
+            return 200, core.snapshot(int(q("offset", "0") or 0), limit, q("q").strip().lower())
+        if path == "/api/logs" and method == "GET":
+            return 200, {"text": self._logs(q("name", "engine"), min(int(q("lines", "200")), 1000))}
+        if path == "/api/site" and method == "GET":
+            name = q("name")
+            if core.registry.get(name, {}).get("type") != "site":
+                return 404, {"error": "Not a site."}
+            try:
+                with open(core.site_index_path(name), "r", encoding="utf-8") as f:
+                    return 200, {"content": f.read()}
+            except OSError:
+                return 200, {"content": ""}
+        if path == "/api/site" and method == "POST":
+            name, content = str(body.get("name", "")), str(body.get("content", ""))
+            if core.registry.get(name, {}).get("type") != "site":
+                return 404, {"error": "Not a site."}
+            size = len(content.encode("utf-8"))
+            if size > MAX_PAGE_BYTES:
+                return 400, {"error": "Page is too large (2 MB max)."}
+            ok, why = core.quota_ok(size)
+            if not ok:
+                return 403, {"error": why}
+            p = core.site_index_path(name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(content)
+            core.log(f"Saved {name}.engine")
+            return 200, {"ok": True}
+        if path == "/api/site/protect" and method == "POST":
+            ok, msg = core.protect_site(str(body.get("name", "")), str(body.get("user", "")),
+                                        str(body.get("password", "")))
+            if ok:
+                store.audit("admin", "site_protect", str(body.get("name")), ip)
+            return (200 if ok else 400), {"ok": ok, "message": msg, "error": None if ok else msg}
+        if path == "/api/site/unprotect" and method == "POST":
+            core.unprotect_site(str(body.get("name", "")))
+            store.audit("admin", "site_unprotect", str(body.get("name")), ip)
+            return 200, {"ok": True}
+        if path == "/api/register" and method == "POST":
+            ok, msg = core.register(body.get("name"), body.get("target", ""), body.get("command", ""),
+                                    body.get("cwd", ""), body.get("autostart", True))
+            if ok:
+                store.audit("admin", "register", msg, ip)
+            return (200 if ok else 400), {"ok": ok, "message": msg, "error": None if ok else msg}
+        if path == "/api/unregister" and method == "POST":
+            name = str(body.get("name", ""))
+            core.drop_node(name)
+            store.audit("admin", "unregister", name, ip)
+            return 200, {"ok": True}
+        if path in ("/api/app/start", "/api/app/stop", "/api/app/restart") and method == "POST":
+            name = str(body.get("name", ""))
+            if not core.procs or not core.registry.get(name, {}).get("command"):
+                return 400, {"error": "This entry has no start command."}
+            ok, msg = getattr(core.procs, path.rsplit("/", 1)[1])(name)
+            return (200 if ok else 400), {"ok": ok, "message": msg, "error": None if ok else msg}
+
+        # ---- reports
+        if path == "/api/report" and method == "GET":
+            user_id, node_id = self._scope(q("scope"))
+            rep = store.report(q("period", "week"), user_id=user_id, node_id=node_id)
+            rep["heat"] = store.heat(user_id=user_id, node_id=node_id)
+            return 200, rep
+
+        # ---- customers
+        if path == "/api/users" and method == "GET":
+            return 200, {"users": store.list_users()}
+        if path == "/api/users" and method == "POST":
+            new_id, err = store.create_user(body.get("username"), body.get("password"),
+                                            body.get("email", ""), body.get("quota_mb", 1024),
+                                            body.get("max_nodes", 1))
+            if err:
+                return 400, {"error": err}
+            store.audit("admin", "user_create", body.get("username"), ip)
+            return 200, {"id": new_id}
+        if path == "/api/users/update" and method == "POST":
+            fields = {k: body[k] for k in ("email", "quota_mb", "max_nodes", "status") if k in body}
+            store.update_user(int(body.get("id", 0)), **fields)
+            if fields.get("status") == "suspended":
+                self.drop_sessions(uid=int(body.get("id", 0)))
+            store.audit("admin", "user_update", f"{body.get('id')} {fields}", ip)
+            return 200, {"ok": True}
+        if path == "/api/users/password" and method == "POST":
+            ok, err = store.set_password(int(body.get("id", 0)), str(body.get("password", "")))
+            if not ok:
+                return 400, {"error": err}
+            self.drop_sessions(uid=int(body.get("id", 0)))
+            store.audit("admin", "user_password_reset", str(body.get("id")), ip)
+            return 200, {"ok": True}
+        if path == "/api/users/delete" and method == "POST":
+            self.drop_sessions(uid=int(body.get("id", 0)))
+            store.delete_user(int(body.get("id", 0)))
+            store.audit("admin", "user_delete", str(body.get("id")), ip)
+            return 200, {"ok": True}
+
+        # ---- customers' small servers
+        if path == "/api/nodes" and method == "GET":
+            nodes = store.list_nodes()
+            users = {u["id"]: u["username"] for u in store.list_users()}
+            for n in nodes:
+                n["owner"] = users.get(n["user_id"], "?")
+                n.pop("sites", None)
+            return 200, {"nodes": nodes}
+        if path == "/api/nodes/create" and method == "POST":
+            nid, token, err = store.create_node(int(body.get("user_id", 0)), str(body.get("name", "server")))
+            if err:
+                return 400, {"error": err}
+            store.audit("admin", "node_create", nid, ip)
+            return 200, {"id": nid, "token": token, "join_code": self.join_code(token)}
+        if path == "/api/nodes/reset" and method == "POST":
+            token = store.reset_node_token(str(body.get("id", "")))
+            if not token:
+                return 404, {"error": "No such server."}
+            store.audit("admin", "node_reset", str(body.get("id")), ip)
+            return 200, {"token": token, "join_code": self.join_code(token)}
+        if path == "/api/nodes/delete" and method == "POST":
+            store.delete_node(str(body.get("id", "")))
+            store.audit("admin", "node_delete", str(body.get("id")), ip)
+            return 200, {"ok": True}
+
+        # ---- private messages
+        if path == "/api/messages" and method == "GET":
+            return 200, {"messages": store.sent_messages()}
+        if path == "/api/messages" and method == "POST":
+            subject, text, kind = str(body.get("subject", "")), str(body.get("body", "")), body.get("kind", "info")
+            if not subject.strip() or not text.strip():
+                return 400, {"error": "Write a subject and a message."}
+            to = str(body.get("to", "")).strip().lower()
+            if to in ("", "*", "all"):
+                n = store.broadcast(subject, text, kind)
+            else:
+                row = [u for u in store.list_users() if u["username"] == to]
+                if not row:
+                    return 404, {"error": "No such customer."}
+                n = 1 if store.send_message(row[0]["id"], subject, text, kind) else 0
+            store.audit("admin", "message", f"to {to or 'all'}: {subject[:60]}", ip)
+            return 200, {"sent": n}
+
+        # ---- security + settings
+        if path == "/api/settings" and method == "GET":
+            return 200, {"settings": core.settings, "tls": {
+                "available": core.tls.available, "fingerprint": core.tls.ca_fingerprint(),
+                "https_port": core.https_port, "admin_https_port": self.https_port}}
+        if path == "/api/settings" and method == "POST":
+            for k, v in body.items():
+                ok, msg = core.set_setting(k, v)
+                if not ok:
+                    return 400, {"error": msg}
+            store.audit("admin", "settings", json.dumps(body)[:200], ip)
+            return 200, {"ok": True, "settings": core.settings}
+        if path == "/api/audit" and method == "GET":
+            return 200, {"audit": store.audit_tail(300)}
+        if path == "/api/admin/password" and method == "POST":
+            auth = read_auth(core.auth_path())
+            if not auth or not check_auth(auth, str(body.get("current", ""))):
+                return 400, {"error": "Current access key is wrong."}
+            new = str(body.get("new", ""))
+            missing = [t for t, ok in password_checks(new) if not ok]
+            if missing:
+                return 400, {"error": "New key still needs: " + "; ".join(missing)}
+            write_auth(core.auth_path(), new)
+            self.drop_sessions(role="admin")
+            store.audit("admin", "admin_key_change", "", ip)
+            return 200, {"ok": True}
+
+        # ---- provider link (when this server is a customer's small server)
+        if path == "/api/mother" and method == "GET":
+            data = {"status": core.mother.status(), "state": core.mother_state,
+                    "inbox": core.store.get_setting("inbox", []) or []}
+            if data["status"]["joined"]:
+                data["report"] = core.mother.report(q("period", "week"))
+            return 200, data
+        if path == "/api/mother/join" and method == "POST":
+            ok, msg = core.mother.join(str(body.get("code", "")))
+            return (200 if ok else 400), {"ok": ok, "message": msg, "error": None if ok else msg}
+        if path == "/api/mother/leave" and method == "POST":
+            core.mother.leave()
+            return 200, {"ok": True}
+        if path == "/api/mother/read" and method == "POST":
+            inbox = core.store.get_setting("inbox", []) or []
+            for m in inbox:
+                m["read"] = True
+            core.store.set_setting("inbox", inbox)
+            return 200, {"ok": True}
+        return 404, {"error": "Not found."}
+
+    # ------------------------------------------------------------- handler
     def _make_handler(self):
         server = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def setup(self):
+                if hasattr(self.request, "do_handshake"):
+                    self.request.do_handshake()
+                    self.request.settimeout(30)
+                super().setup()
+
             def log_message(self, *args):
                 pass
 
-            def _send(self, code, body, ctype):
+            def _secure(self):
+                return isinstance(self.request, ssl.SSLSocket)
+
+            def _send(self, code, body, ctype, extra=None):
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                                 "script-src 'self' 'unsafe-inline'; img-src 'self' data:")
+                if self._secure():
+                    self.send_header("Strict-Transport-Security", "max-age=31536000")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(body)
 
             def _json(self, code, obj):
                 self._send(code, json.dumps(obj).encode(), "application/json")
 
-            def _authed(self):
-                h = self.headers.get("Authorization", "")
-                return h.startswith("Bearer ") and server.valid_token(h[7:])
-
-            def _read_json(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_PAGE_BYTES + 10000:
-                    raise ValueError("Request too large.")
-                raw = self.rfile.read(length) if length else b"{}"
-                return json.loads(raw or b"{}")
-
-            def do_GET(self):
+            def _dispatch(self, method):
                 url = urlparse(self.path)
-                if url.path in ("/", "/index.html"):
+                ip = self.client_address[0]
+                loopback = ip.startswith("127.") or ip == "::1"
+                if method == "GET" and url.path in ("/", "/index.html"):
+                    if server.https_port and not self._secure() and not loopback:
+                        host = (self.headers.get("Host") or "localhost").split(":")[0]
+                        self._send(301, b"", "text/plain",
+                                   {"Location": f"https://{host}:{server.https_port}/"})
+                        return
                     self._send(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    return
+                if method == "GET" and url.path == "/ca.crt":
+                    pem = server.core.tls.ca_pem()
+                    if not pem:
+                        self._json(404, {"error": "HTTPS is not set up."})
+                        return
+                    self._send(200, pem, "application/x-x509-ca-cert",
+                               {"Content-Disposition": 'attachment; filename="engine-ca.crt"'})
                     return
                 if not url.path.startswith("/api/"):
                     self._json(404, {"error": "Not found."})
                     return
-                if not self._authed():
-                    self._json(401, {"error": "Not signed in."})
+                if server.https_port and not self._secure() and not loopback:
+                    self._json(403, {"error": f"Use HTTPS on port {server.https_port}."})
                     return
-                q = parse_qs(url.query)
-                core = server.core
-                try:
-                    if url.path == "/api/state":
-                        self._json(200, core.snapshot())
-                    elif url.path == "/api/logs":
-                        name = (q.get("name") or ["engine"])[0]
-                        lines = min(int((q.get("lines") or ["200"])[0]), 1000)
-                        self._json(200, {"text": self._logs(name, lines)})
-                    elif url.path == "/api/site":
-                        name = (q.get("name") or [""])[0]
-                        if core.registry.get(name, {}).get("type") != "site":
-                            self._json(404, {"error": "Not a site."})
+                body = {}
+                if method == "POST":
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                        if length > MAX_BODY:
+                            self._json(413, {"error": "Request too large."})
                             return
-                        try:
-                            with open(core.site_index_path(name), "r", encoding="utf-8") as f:
-                                content = f.read()
-                        except OSError:
-                            content = ""
-                        self._json(200, {"content": content})
-                    else:
-                        self._json(404, {"error": "Not found."})
+                        body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                    except Exception:
+                        self._json(400, {"error": "Bad request."})
+                        return
+                auth = self.headers.get("Authorization", "")
+                token = auth[7:] if auth.startswith("Bearer ") else ""
+                sess = server.session(token)
+                try:
+                    code, obj = server.handle(method, url.path, parse_qs(url.query), body, ip,
+                                              sess, token)
                 except Exception as e:
-                    self._json(500, {"error": str(e)})
+                    code, obj = 500, {"error": str(e)}
+                self._json(code, obj)
 
-            def _logs(self, name, lines):
-                core = server.core
-                if name == "engine":
-                    return "\n".join(core.log_ring[-lines:])
-                if name == "access":
-                    return tail_file(os.path.join(core.data_dir(), "logs", "access.log"), lines)
-                if name in core.registry and core.procs:
-                    return tail_file(core.procs.log_path(name), lines)
-                return ""
+            def do_GET(self):
+                self._dispatch("GET")
 
             def do_POST(self):
-                url = urlparse(self.path)
-                core = server.core
-                try:
-                    body = self._read_json()
-                except Exception:
-                    self._json(400, {"error": "Bad request."})
-                    return
-                if url.path == "/api/login":
-                    code, obj = server.login(self.client_address[0], body.get("password"))
-                    self._json(code, obj)
-                    return
-                if not self._authed():
-                    self._json(401, {"error": "Not signed in."})
-                    return
-                try:
-                    if url.path == "/api/register":
-                        ok, msg = core.register(
-                            body.get("name"), body.get("target", ""), body.get("command", ""),
-                            body.get("cwd", ""), body.get("autostart", True))
-                        self._json(200 if ok else 400, {"ok": ok, "message": msg, "error": None if ok else msg})
-                    elif url.path == "/api/unregister":
-                        core.drop_node(str(body.get("name", "")))
-                        self._json(200, {"ok": True})
-                    elif url.path in ("/api/app/start", "/api/app/stop", "/api/app/restart"):
-                        name = str(body.get("name", ""))
-                        if not core.procs or not core.registry.get(name, {}).get("command"):
-                            self._json(400, {"error": "This entry has no start command."})
-                            return
-                        action = url.path.rsplit("/", 1)[1]
-                        ok, msg = getattr(core.procs, action)(name)
-                        self._json(200 if ok else 400, {"ok": ok, "message": msg, "error": None if ok else msg})
-                    elif url.path == "/api/site":
-                        name = str(body.get("name", ""))
-                        content = str(body.get("content", ""))
-                        if core.registry.get(name, {}).get("type") != "site":
-                            self._json(404, {"error": "Not a site."})
-                            return
-                        if len(content.encode("utf-8")) > MAX_PAGE_BYTES:
-                            self._json(400, {"error": "Page is too large (2 MB max)."})
-                            return
-                        path = core.site_index_path(name)
-                        os.makedirs(os.path.dirname(path), exist_ok=True)
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        core.log(f"Saved {name}.engine")
-                        self._json(200, {"ok": True})
-                    else:
-                        self._json(404, {"error": "Not found."})
-                except Exception as e:
-                    self._json(500, {"error": str(e)})
+                self._dispatch("POST")
 
         return Handler
-
-
-DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>.engine</title>
-<style>
-  :root { --bg:#05080f; --panel:#0a1220; --line:rgba(0,240,255,.28); --acc:#00f0ff;
-          --good:#00ff9c; --warn:#ffd60a; --bad:#ff4d6d; --txt:#d6f6ff; --mut:#5f7a94; }
-  * { box-sizing:border-box; }
-  body { margin:0; color:var(--txt); background-color:var(--bg);
-         background-image:linear-gradient(rgba(0,240,255,.045) 1px, transparent 1px),
-                          linear-gradient(90deg, rgba(0,240,255,.045) 1px, transparent 1px);
-         background-size:36px 36px; font-family:ui-monospace,Menlo,Consolas,monospace; }
-  .wrap { max-width:1100px; margin:0 auto; padding:20px 16px 60px; }
-  h1 { margin:0; color:var(--acc); font-size:1.7rem; }
-  h2 { margin:0 0 12px; font-size:.8rem; color:var(--mut); letter-spacing:.12em; font-weight:normal; }
-  .top { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }
-  .top .sp { flex:1; }
-  .chip { padding:4px 10px; border:1px solid var(--line); border-radius:6px; font-size:.8rem; }
-  .good { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); } .mut { color:var(--mut); }
-  .panel, .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; }
-  .panel { padding:16px; margin-bottom:16px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:16px; }
-  .card { padding:12px 14px; }
-  .card .lbl { font-size:.7rem; color:var(--mut); letter-spacing:.1em; }
-  .card .val { font-size:1.5rem; color:var(--acc); margin:4px 0; }
-  .card .sub { font-size:.72rem; color:var(--mut); }
-  .track { height:6px; background:#10202e; border-radius:3px; margin-top:6px; overflow:hidden; }
-  .fill { height:100%; background:var(--good); } .fill.mid { background:var(--warn); } .fill.hi { background:var(--bad); }
-  input, select, textarea { width:100%; background:#05080f; color:var(--txt); border:1px solid var(--line);
-         border-radius:6px; padding:10px; font:inherit; }
-  textarea { min-height:55vh; resize:vertical; }
-  button { background:var(--acc); color:#05080f; border:0; border-radius:6px; padding:9px 14px;
-           font:inherit; cursor:pointer; }
-  button.alt { background:transparent; color:var(--acc); border:1px solid var(--line); padding:6px 10px; font-size:.8rem; }
-  button.danger { background:transparent; color:var(--bad); border:1px solid rgba(255,77,109,.5); padding:6px 10px; font-size:.8rem; }
-  .form { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; align-items:end; }
-  label { font-size:.7rem; color:var(--mut); display:block; margin-bottom:4px; }
-  table { width:100%; border-collapse:collapse; font-size:.85rem; }
-  th { text-align:left; font-weight:normal; color:var(--mut); font-size:.7rem; letter-spacing:.1em; padding:6px; }
-  td { padding:8px 6px; border-top:1px solid rgba(0,240,255,.1); vertical-align:middle; }
-  td.act { white-space:nowrap; text-align:right; } td.act > * { margin-left:4px; }
-  .scroll { overflow-x:auto; }
-  a { color:var(--acc); }
-  pre { margin:0; max-height:300px; overflow:auto; font-size:.75rem; color:var(--mut); white-space:pre-wrap; }
-  #login { min-height:100vh; display:grid; place-items:center; padding:16px; }
-  #login .panel { width:100%; max-width:380px; }
-  #msg { margin-top:8px; font-size:.8rem; min-height:1em; }
-  dialog { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:10px;
-           width:min(900px,95vw); padding:16px; }
-  dialog::backdrop { background:rgba(0,0,0,.7); }
-</style>
-</head>
-<body>
-<div id="login">
-  <div class="panel">
-    <h1>&gt; .engine</h1>
-    <p class="mut" style="font-size:.8rem">SECURE TERMINAL // AUTH REQUIRED</p>
-    <label>ACCESS KEY</label>
-    <input id="pw" type="password" autocomplete="current-password">
-    <div style="margin-top:12px"><button id="loginBtn" style="width:100%">[ UNLOCK ]</button></div>
-    <div id="loginErr" class="bad" style="margin-top:10px;font-size:.8rem"></div>
-  </div>
-</div>
-
-<div id="app" class="wrap" hidden>
-  <div class="top">
-    <h1>&gt; .engine</h1>
-    <span id="status" class="chip good">[ ONLINE ]</span>
-    <span id="ports" class="mut" style="font-size:.78rem"></span>
-    <span class="sp"></span>
-    <span id="uptime" class="mut" style="font-size:.78rem"></span>
-    <button class="alt" id="logout">Lock</button>
-  </div>
-
-  <h2>// SYSTEM</h2>
-  <div class="grid" id="meters"></div>
-
-  <h2>// TRAFFIC</h2>
-  <div class="grid" id="totals"></div>
-
-  <div class="panel">
-    <h2>// REGISTER A SITE OR APP</h2>
-    <div class="form">
-      <div><label>NAME</label><input id="rName" placeholder="shop"></div>
-      <div><label>TARGET (blank = new site, port = app, folder = site)</label><input id="rTarget" placeholder="8001  or  /var/www/shop"></div>
-      <div><label>START COMMAND (optional, engine runs and restarts it)</label><input id="rCmd" placeholder="python app.py"></div>
-      <div><label>WORKING FOLDER (optional)</label><input id="rCwd" placeholder="/home/me/app"></div>
-      <div><button id="rBtn" style="width:100%">[ REGISTER ]</button></div>
-    </div>
-    <div id="msg"></div>
-  </div>
-
-  <div class="panel">
-    <h2>// SITES AND APPS</h2>
-    <div class="scroll"><table>
-      <thead><tr><th>NAME</th><th>TYPE</th><th>STATUS</th><th>REQUESTS</th><th>TRAFFIC</th><th></th></tr></thead>
-      <tbody id="rows"></tbody>
-    </table></div>
-  </div>
-
-  <div class="panel">
-    <h2>// LOGS</h2>
-    <select id="logSel" style="max-width:260px;margin-bottom:10px"></select>
-    <pre id="logBox"></pre>
-  </div>
-</div>
-
-<dialog id="editor">
-  <h2 id="edTitle">// EDIT index.html</h2>
-  <textarea id="edText" spellcheck="false"></textarea>
-  <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
-    <button id="edSave">[ SAVE ]</button><button class="alt" id="edClose">Close</button>
-    <span id="edMsg" class="good" style="font-size:.8rem"></span>
-  </div>
-</dialog>
-
-<script>
-const $ = (s) => document.querySelector(s);
-const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
-let token = sessionStorage.getItem("engine_token") || "";
-let state = null, logName = "engine", editing = "", timer = null;
-
-async function api(path, body) {
-  const opt = { headers: { "Content-Type": "application/json" } };
-  if (token) opt.headers.Authorization = "Bearer " + token;
-  if (body !== undefined) { opt.method = "POST"; opt.body = JSON.stringify(body); }
-  const r = await fetch(path, opt);
-  let data = {}; try { data = await r.json(); } catch (e) {}
-  if (r.status === 401 && path !== "/api/login") { lock(); throw new Error("Session ended."); }
-  if (!r.ok) throw new Error(data.error || r.statusText);
-  return data;
-}
-
-function fmtBytes(n) {
-  if (n < 1024) return n + " B";
-  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
-  if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
-  return (n / 1073741824).toFixed(2) + " GB";
-}
-function fmtUp(s) {
-  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return (d ? d + "d " : "") + h + "h " + m + "m";
-}
-function card(label, value, sub, pct) {
-  const c = el("div", "card");
-  c.append(el("div", "lbl", label), el("div", "val", value));
-  if (pct != null) {
-    const t = el("div", "track"), f = el("div", "fill" + (pct > 85 ? " hi" : pct > 60 ? " mid" : ""));
-    f.style.width = Math.min(100, pct) + "%"; t.append(f); c.append(t);
-  }
-  if (sub) c.append(el("div", "sub", sub));
-  return c;
-}
-function pctText(p) { return p == null ? "n/a" : p.toFixed(0) + "%"; }
-
-function render() {
-  const s = state, m = s.metrics;
-  $("#ports").textContent = "proxy:" + (s.proxy_port || "-") + "  dns:" + (s.dns_port || "-") + "  dashboard:" + (s.admin_port || "-") + "  ip:" + s.lan_ip;
-  $("#uptime").textContent = "uptime " + fmtUp(s.uptime) + "  v" + s.version;
-
-  const meters = $("#meters"); meters.replaceChildren();
-  meters.append(card("CPU", pctText(m.cpu), (m.cores || "?") + " cores", m.cpu));
-  if (m.mem) meters.append(card("MEMORY", pctText(m.mem.percent), fmtBytes(m.mem.used) + " / " + fmtBytes(m.mem.total), m.mem.percent));
-  if (m.disk) meters.append(card("DISK", pctText(m.disk.percent), fmtBytes(m.disk.used) + " / " + fmtBytes(m.disk.total), m.disk.percent));
-  if (!m.gpus.length) meters.append(card("GPU", "none", "no NVIDIA GPU detected"));
-  m.gpus.forEach((g, i) => {
-    meters.append(card("GPU " + i + "  " + g.temp + "°C", pctText(g.util), g.name, g.util));
-    meters.append(card("VRAM " + i, pctText(100 * g.mem_used / g.mem_total), g.mem_used.toFixed(0) + " / " + g.mem_total.toFixed(0) + " MB", 100 * g.mem_used / g.mem_total));
-  });
-
-  const t = $("#totals"); t.replaceChildren();
-  t.append(card("REQUESTS", String(s.totals.requests)), card("TRAFFIC", fmtBytes(s.totals.bytes)),
-           card("ACTIVE TUNNELS", String(s.totals.tunnels)), card("ENTRIES", String(s.entries.length) + " / 15"));
-
-  const rows = $("#rows"); rows.replaceChildren();
-  if (!s.entries.length) { const tr = el("tr"), td = el("td", "mut", "Nothing registered yet."); td.colSpan = 6; tr.append(td); rows.append(tr); }
-  s.entries.forEach((e) => {
-    const tr = el("tr");
-    const nameTd = el("td");
-    const a = el("a", "", e.name + ".engine"); a.href = e.url; a.target = "_blank";
-    nameTd.append(a);
-    const kind = e.type === "site" ? "site" : (e.command ? "managed app :" + e.port : "app :" + e.port);
-    const st = el("td", e.ok ? "good" : "warn", e.status);
-    if (e.process && e.process.running) st.textContent += "  (pid " + e.process.pid + ", " + fmtUp(e.process.uptime) + (e.process.restarts ? ", " + e.process.restarts + " restarts" : "") + ")";
-    const act = el("td", "act");
-    const open = el("a", "", "Open"); open.href = "http://" + location.hostname + ":" + s.proxy_port + "/_/" + e.name + "/"; open.target = "_blank";
-    const ob = el("button", "alt"); ob.append(open); act.append(ob);
-    if (e.type === "site") { const b = el("button", "alt", "Edit"); b.onclick = () => openEditor(e.name); act.append(b); }
-    if (e.command) {
-      const run = e.process && e.process.running;
-      const b1 = el("button", "alt", run ? "Stop" : "Start"); b1.onclick = () => action(run ? "stop" : "start", e.name);
-      const b2 = el("button", "alt", "Restart"); b2.onclick = () => action("restart", e.name);
-      act.append(b1, b2);
-    }
-    const del = el("button", "danger", "Unbind"); del.onclick = async () => { if (confirm("Unbind " + e.name + ".engine ?")) { await api("/api/unregister", { name: e.name }); tick(); } };
-    act.append(del);
-    tr.append(nameTd, el("td", "mut", kind), st, el("td", "", String(e.requests)), el("td", "", fmtBytes(e.bytes)), act);
-    rows.append(tr);
-  });
-
-  const sel = $("#logSel"), keep = sel.value || logName;
-  const names = ["engine", "access"].concat(s.entries.filter((e) => e.command).map((e) => e.name));
-  if (sel.options.length !== names.length) {
-    sel.replaceChildren(); names.forEach((n) => { const o = el("option", "", n === "engine" ? "engine log" : n === "access" ? "access log" : "app: " + n); o.value = n; sel.append(o); });
-    sel.value = names.includes(keep) ? keep : "engine";
-  }
-}
-
-async function action(kind, name) {
-  try { await api("/api/app/" + kind, { name }); } catch (e) { alert(e.message); }
-  tick();
-}
-async function loadLogs() {
-  try { const r = await api("/api/logs?name=" + encodeURIComponent(logName) + "&lines=200"); const box = $("#logBox"); const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20; box.textContent = r.text || "(empty)"; if (atEnd) box.scrollTop = box.scrollHeight; } catch (e) {}
-}
-async function tick() {
-  try { state = await api("/api/state"); render(); $("#status").textContent = "[ ONLINE ]"; $("#status").className = "chip good"; loadLogs(); }
-  catch (e) { $("#status").textContent = "[ OFFLINE ]"; $("#status").className = "chip bad"; }
-}
-function show() { $("#login").hidden = true; $("#app").hidden = false; tick(); clearInterval(timer); timer = setInterval(tick, 2000); }
-function lock() { token = ""; sessionStorage.removeItem("engine_token"); clearInterval(timer); $("#app").hidden = true; $("#login").hidden = false; }
-
-async function doLogin() {
-  $("#loginErr").textContent = "";
-  try { const r = await api("/api/login", { password: $("#pw").value }); token = r.token; sessionStorage.setItem("engine_token", token); $("#pw").value = ""; show(); }
-  catch (e) { $("#loginErr").textContent = e.message; }
-}
-$("#loginBtn").onclick = doLogin;
-$("#pw").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
-$("#logout").onclick = lock;
-$("#logSel").onchange = (e) => { logName = e.target.value; loadLogs(); };
-
-$("#rBtn").onclick = async () => {
-  const m = $("#msg"); m.className = ""; m.textContent = "";
-  try {
-    const r = await api("/api/register", { name: $("#rName").value, target: $("#rTarget").value, command: $("#rCmd").value, cwd: $("#rCwd").value, autostart: true });
-    m.className = "good"; m.textContent = r.message;
-    ["#rName", "#rTarget", "#rCmd", "#rCwd"].forEach((i) => $(i).value = ""); tick();
-  } catch (e) { m.className = "bad"; m.textContent = e.message; }
-};
-
-async function openEditor(name) {
-  editing = name; $("#edMsg").textContent = ""; $("#edTitle").textContent = "// EDIT " + name + ".engine  (index.html)";
-  try { const r = await api("/api/site?name=" + encodeURIComponent(name)); $("#edText").value = r.content; $("#editor").showModal(); } catch (e) { alert(e.message); }
-}
-$("#edSave").onclick = async () => { try { await api("/api/site", { name: editing, content: $("#edText").value }); $("#edMsg").textContent = "Saved. Reload the site."; } catch (e) { $("#edMsg").textContent = e.message; } };
-$("#edClose").onclick = () => $("#editor").close();
-
-if (token) { api("/api/state").then(() => show()).catch(() => lock()); }
-</script>
-</body>
-</html>
-"""
