@@ -61,6 +61,10 @@ class Store:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self._pending = {}
         self._schema()
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------ plumbing
     def q(self, sql, args=()):
