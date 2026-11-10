@@ -25,14 +25,18 @@ from kivy.utils import get_color_from_hex as hx, platform
 # If a required module is missing from the app, show a clean message instead
 # of closing silently. Details go to a private log file only.
 try:
-    from engine_core import InfrastructureCore, MAX_APPS, default_registry_path
     from engine_infra import (password_checks, read_auth, write_auth, check_auth,
-                              MAX_FAILS, LOCK_SECONDS, RemoteClient)
+                              MAX_FAILS, LOCK_SECONDS, RemoteClient, CertificateChanged,
+                              split_address)
+    if platform not in ("android", "ios"):
+        from engine_core import InfrastructureCore, MAX_APPS, default_registry_path
+    else:  # the phone is only a companion: it never loads the server code
+        InfrastructureCore, MAX_APPS, default_registry_path = None, 4600, None
     IMPORT_ERROR = None
 except Exception:
     IMPORT_ERROR = traceback.format_exc()
     InfrastructureCore = None
-    MAX_APPS = 15
+    MAX_APPS = 4600
     default_registry_path = None
 
 # =====================================================================
@@ -232,6 +236,77 @@ class Bar(Widget):
                              radius=[dp(3)])
 
 
+class Sparkline(Widget):
+    """Live line chart."""
+    def __init__(self, color=ACCENT, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(70))
+        super().__init__(**kw)
+        self.values = []
+        self.color = list(color)
+        self.bind(pos=self._draw, size=self._draw)
+
+    def set(self, values):
+        self.values = list(values)[-60:]
+        self._draw()
+
+    def _draw(self, *args):
+        try:
+            self.canvas.clear()
+            with self.canvas:
+                Color(*GRID)
+                Line(points=[self.x, self.y + dp(2), self.right, self.y + dp(2)], width=1)
+                vals = self.values
+                if len(vals) < 2:
+                    return
+                top = max(max(vals), 1)
+                pts = []
+                for i, v in enumerate(vals):
+                    pts += [self.x + i * self.width / (len(vals) - 1),
+                            self.y + dp(4) + (self.height - dp(8)) * v / top]
+                Color(*self.color)
+                Line(points=pts, width=dp(1.4))
+        except Exception:
+            pass
+
+
+class HeatMatrix(Widget):
+    """Activity matrix: one cell per day, brighter = more requests."""
+    def __init__(self, **kw):
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", dp(7 * 15 + 4))
+        super().__init__(**kw)
+        self.days = []
+        self.data = {}
+        self.bind(pos=self._draw, size=self._draw)
+
+    def set(self, days, data):
+        self.days, self.data = list(days), dict(data)
+        self._draw()
+
+    def _draw(self, *args):
+        try:
+            self.canvas.clear()
+            if not self.days:
+                return
+            cols = (len(self.days) + 6) // 7
+            gap = dp(2)
+            cell = max(dp(4), min(dp(14), (self.width - dp(4)) / cols - gap))
+            top = max(max(self.data.values(), default=0), 1)
+            with self.canvas:
+                for i, day in enumerate(self.days):
+                    v = self.data.get(day, 0)
+                    if v:
+                        Color(0.0, 0.94, 1.0, 0.18 + 0.82 * (v / top) ** 0.5)
+                    else:
+                        Color(0.043, 0.102, 0.149, 1)
+                    x = self.x + dp(2) + (i // 7) * (cell + gap)
+                    y = self.top - dp(2) - (i % 7 + 1) * (cell + gap)
+                    RoundedRectangle(pos=(x, y), size=(cell, cell), radius=[dp(2)])
+        except Exception:
+            pass
+
+
 class StatCard(Panel):
     def __init__(self, title, value, accent=ACCENT, **kw):
         super().__init__(orientation="vertical", padding=dp(10), spacing=dp(2), **kw)
@@ -298,7 +373,7 @@ class EnginePlatform(App):
         if self.phone:
             Window.softinput_mode = "below_target"
         else:
-            Window.size = (860, 940)
+            Window.size = (900, 1000)
 
         self._rendered_log_key = None
         self.status_labels = {}
@@ -520,6 +595,24 @@ class EnginePlatform(App):
             meters.add_widget(m)
         rw.add_widget(meters)
 
+        charts = GridLayout(cols=2, spacing=dp(8), size_hint_y=None, height=dp(132))
+        live = Panel(orientation="vertical", padding=dp(10), spacing=dp(4))
+        live.add_widget(make_label("REQUESTS / SECOND  (LIVE)", size=10, color=MUTED,
+                                   size_hint_y=None, height=dp(16)))
+        self.sparkline = Sparkline(size_hint_y=1)
+        live.add_widget(self.sparkline)
+        matrix = Panel(orientation="vertical", padding=dp(10), spacing=dp(4))
+        matrix.add_widget(make_label("ACTIVITY MATRIX  (20 WEEKS)", size=10, color=MUTED,
+                                     size_hint_y=None, height=dp(16)))
+        self.heat = HeatMatrix()
+        matrix.add_widget(self.heat)
+        charts.add_widget(live)
+        charts.add_widget(matrix)
+        rw.add_widget(charts)
+        self._rps_history = []
+        self._last_req = None
+        self._last_heat = 0
+
         bind_panel = Panel(orientation="vertical", padding=dp(12), spacing=dp(8),
                            size_hint_y=None, height=dp(214))
         row = BoxLayout(spacing=dp(8), size_hint_y=None, height=dp(48))
@@ -653,7 +746,9 @@ class EnginePlatform(App):
                 size=12, color=MUTED, halign="center",
                 size_hint_y=None, height=dp(60)))
 
-        for name, cfg in self.core.registry.items():
+        shown = sorted(self.core.registry)[:30]
+        for name in shown:
+            cfg = self.core.registry[name]
             is_site = cfg.get("type") == "site"
             managed = bool(cfg.get("command"))
             row = Panel(orientation="horizontal", padding=[dp(14), dp(8)], spacing=dp(8),
@@ -685,13 +780,33 @@ class EnginePlatform(App):
             row.add_widget(actions)
             self.routing_grid.add_widget(row)
 
+        if len(self.core.registry) > len(shown):
+            self.routing_grid.add_widget(make_label(
+                f"+{len(self.core.registry) - len(shown)} more. Open the DASHBOARD to search and manage all.",
+                size=11, color=MUTED, halign="center", size_hint_y=None, height=dp(40)))
         self.nodes_tracker_label.text = (
             f"// SITES AND APPS  {len(self.core.registry)}/{MAX_APPS}")
 
     def _apply_snapshot(self, snap):
+        mother = snap.get("mother", {})
         self.net_label.text = (
-            f"proxy:{snap['proxy_port'] or '-'}  dns:{snap['dns_port'] or '-'}  "
-            f"dashboard:{snap['admin_port'] or '-'}  ip:{snap['lan_ip']}")
+            f"http:{snap['proxy_port'] or '-'}  https:{snap['https_port'] or 'off'}  "
+            f"dns:{snap['dns_port'] or '-'}  dash:{snap['admin_port'] or '-'}  ip:{snap['lan_ip']}"
+            + ("  provider:" + ("ok" if mother.get("connected") else "down") if mother.get("joined") else ""))
+        now = time.time()
+        total = snap["totals"]["requests"]
+        if self._last_req is not None:
+            rate = max(0, total - self._last_req[0]) / max(0.5, now - self._last_req[1])
+            self._rps_history.append(rate)
+            self.sparkline.set(self._rps_history)
+        self._last_req = (total, now)
+        if now - self._last_heat > 60:
+            self._last_heat = now
+            try:
+                h = self.core.store.local_heat()
+                self.heat.set(h["days"], h["requests"])
+            except Exception:
+                pass
         m = snap["metrics"]
         self.cpu_meter.set(m["cpu"])
         self.ram_meter.set(m["mem"]["percent"] if m["mem"] else None)
@@ -720,7 +835,7 @@ class EnginePlatform(App):
             now = time.time()
             if now - self._last_snapshot >= 2:
                 self._last_snapshot = now
-                self._apply_snapshot(core.snapshot())
+                self._apply_snapshot(core.snapshot(0, 30))
 
             merged = sorted(set(self.log_buffer))[-40:]
             key = (len(merged), merged[-1] if merged else "")
@@ -786,11 +901,22 @@ class EnginePlatform(App):
         panel.add_widget(NeonButton(text="[ CONNECT ]", size_hint_y=None, height=dp(46),
                                     on_release=self.connect))
         rw.add_widget(panel)
+        rw.add_widget(NeonButton(text="FORGET SAVED TRUST", bg=MUTED, font_size=sp(11),
+                                 size_hint_y=None, height=dp(34), on_release=self.forget_trust))
         rw.add_widget(make_label(
             "The full engine runs on your computer.\n"
             "This app monitors it and opens your sites.",
             size=11, color=MUTED, halign="center", size_hint_y=None, height=dp(44)))
         rw.add_widget(BoxLayout())
+
+    @guarded
+    def forget_trust(self, instance):
+        host = split_address(self.addr_field.input.text)[1]
+        prefs = self._load_prefs()
+        prefs.get("pins", {}).pop(host, None)
+        self._save_prefs(prefs)
+        self.connect_msg.text = "Saved trust cleared. Connect again."
+        self.connect_msg.color = MUTED
 
     @guarded
     def connect(self, instance):
@@ -806,8 +932,12 @@ class EnginePlatform(App):
         def work():
             client, ok, err = None, False, ""
             try:
-                client = RemoteClient(address)
+                host = split_address(address)[1]
+                pin = self._load_prefs().get("pins", {}).get(host)
+                client = RemoteClient(address, pin=pin)
                 ok, err = client.login(key)
+            except CertificateChanged as e:
+                err = str(e)
             except Exception:
                 err = ("Cannot reach the engine. Check the address and that "
                        "your phone is on the same Wi-Fi.")
@@ -820,7 +950,11 @@ class EnginePlatform(App):
             self.connect_msg.color = DANGER
             return
         self.client = client
-        self._save_prefs({"address": address})
+        prefs = self._load_prefs()
+        prefs["address"] = address
+        if client.pin:
+            prefs.setdefault("pins", {})[client.host] = client.pin
+        self._save_prefs(prefs)
         self._remote_state = None
         self._remote_error = None
         self._entries_key = None
